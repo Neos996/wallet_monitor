@@ -1,0 +1,62 @@
+sequenceDiagram
+  autonumber
+  participant B as BusinessSystem
+  participant A as wallet_monitor API
+  participant D as SQLite/GORM
+  participant S as Scanner
+  participant C as ChainAdapter
+  participant N as TronGrid/Node
+  participant H as CallbackEndpoint
+
+  B->>A: POST /addresses\n(chain, network, address, asset_type, token_contract, callback_url,\nmin_confirmations, start_height?)
+  A->>D: Save WatchedAddress\n(last_seen_height initialized)
+  D-->>A: OK
+  A-->>B: 201 Created
+
+  Note over S: 定时任务触发 or POST /scan/once
+  S->>D: Load enabled watched addresses
+  D-->>S: WatchedAddress list
+
+  loop each watched address
+    S->>C: ScanAddress(watched, last_seen_height)
+    alt tron native
+      C->>N: Query account transactions\n(confirmed TRX incoming)
+      N-->>C: tx list + current block height
+    else tron trc20
+      C->>N: Query account TRC20 transactions
+      C->>N: Query transaction detail by txid\n(fetch block height)
+      N-->>C: tx list + current block height
+    else mock
+      C-->>S: Read mock transactions
+    end
+
+    C-->>S: Normalized Tx list
+
+    alt no new incoming tx
+      S-->>S: End current watched target
+    else duplicated tx (already delivered)
+      S->>D: Check ProcessedTx
+      D-->>S: Already exists
+      S-->>S: Skip enqueue
+    else new valid incoming tx
+      S->>D: Insert CallbackTask (unique)\n(status=pending, next_retry_at=now)
+      D-->>S: Created or duplicate
+      S->>D: Update WatchedAddress.last_seen_height
+    end
+  end
+
+  Note over S: 本轮扫描结束后，处理到期回调任务
+  S->>D: Load due CallbackTask\n(status in pending/retrying,\nnext_retry_at <= now)
+  D-->>S: Task list
+
+  loop each callback task
+    S->>H: HTTP POST callback payload\n(+ optional signature headers)
+    alt callback returns 2xx
+      H-->>S: ACK
+      Note over H: Business side matches order,\nupdates payment status and accounting
+      S->>D: Update task status=success\nInsert ProcessedTx
+    else callback timeout / non-2xx
+      H-->>S: Error
+      S->>D: Update task status=retrying/dead\n(backoff + last_error)
+    end
+  end
