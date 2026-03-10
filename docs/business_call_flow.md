@@ -23,29 +23,29 @@ sequenceDiagram
   participant N as TronGrid/Node
   participant H as CallbackEndpoint
 
-  B->>A: POST /addresses\n(chain, network, address, asset_type, token_contract, callback_url,\nmin_confirmations, start_height?)
-  A->>D: Save WatchedAddress\n(last_seen_height initialized)
+  B->>A: POST /addresses (register watch)
+  A->>D: Save WatchedAddress (init last_seen_height)
   D-->>A: OK
   A-->>B: 201 Created
 
-  Note over S: 定时任务触发 or POST /scan/once
+  Note right of S: 定时任务触发 / POST /scan/once
   S->>D: Load enabled watched addresses
   D-->>S: WatchedAddress list
 
   loop each watched address
     S->>C: ScanAddress(watched, last_seen_height)
     alt tron native
-      C->>N: Query account transactions\n(confirmed TRX incoming)
+      C->>N: Query account transactions (confirmed TRX incoming)
       N-->>C: tx list + current block height
     else tron trc20
       C->>N: Query account TRC20 transactions
-      C->>N: Query transaction detail by txid\n(fetch block height)
+      C->>N: Query tx detail by txid (get block height)
       N-->>C: tx list + current block height
     else mock
       C-->>S: Read mock transactions
     end
 
-    C-->>S: Normalized Tx list
+    C-->>S: Normalized tx list
 
     alt no new incoming tx
       S-->>S: End current watched target
@@ -54,25 +54,25 @@ sequenceDiagram
       D-->>S: Already exists
       S-->>S: Skip enqueue
     else new valid incoming tx
-      S->>D: Insert CallbackTask (unique)\n(status=pending, next_retry_at=now)
+      S->>D: Insert CallbackTask (unique; pending; next_retry_at=now)
       D-->>S: Created or duplicate
       S->>D: Update WatchedAddress.last_seen_height
     end
   end
 
-  Note over S: 本轮扫描结束后，处理到期回调任务
-  S->>D: Load due CallbackTask\n(status in pending/retrying,\nnext_retry_at <= now)
+  Note right of S: 本轮扫描结束后，处理到期回调任务
+  S->>D: Load due CallbackTask (pending/retrying; next_retry_at <= now)
   D-->>S: Task list
 
   loop each callback task
-    S->>H: HTTP POST callback payload\n(+ optional signature headers)
+    S->>H: HTTP POST callback payload (+ signature headers)
     alt callback returns 2xx
       H-->>S: ACK
-      Note over H: Business side matches order,\nupdates payment status and accounting
-      S->>D: Update task status=success\nInsert ProcessedTx
+      Note right of H: 业务侧匹配订单，更新支付状态与账务
+      S->>D: Update task status=success; Insert ProcessedTx
     else callback timeout / non-2xx
       H-->>S: Error
-      S->>D: Update task status=retrying/dead\n(backoff + last_error)
+      S->>D: Update task status=retrying/dead (backoff + last_error)
     end
   end
 ```
