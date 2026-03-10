@@ -135,12 +135,18 @@
 - `callback_pending` / `callback_retrying` / `callback_success` / `callback_dead`
 - `debug_callbacks`
 
-## 7. 本地联调接口（建议生产隔离）
+## 7. 指标
+
+`GET /metrics`
+
+Prometheus 指标（默认与管理接口同鉴权）。指标清单见 [OBSERVABILITY.md](OBSERVABILITY.md)。
+
+## 8. 本地联调接口（建议生产隔离）
 
 - `GET/POST/DELETE /mock/transactions`
 - `GET/POST/DELETE /debug/callbacks`
 
-## 8. 回调协议（业务侧）
+## 9. 回调协议（业务侧）
 
 ### 8.1 回调请求
 
@@ -205,4 +211,3 @@ printf "%s.%s" "$timestamp" "$payload" \
 ### 8.4 成功响应
 
 业务侧返回任意 `2xx` 表示成功；非 2xx 或超时会进入重试队列，超过最大重试次数进入 `dead`。
-

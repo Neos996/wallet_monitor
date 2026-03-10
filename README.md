@@ -109,6 +109,8 @@ TRON 生产收款场景一般不需要回填历史入账。
 - `-callback-retry-base`：回调失败重试基准间隔（指数退避基数），默认 `10s`
 - `-callback-max-retries`：最大重试次数，默认 `5`
 - `-callback-batch`：每轮扫描后处理的回调任务上限，默认 `100`
+- `-callback-workers`：回调发送并发数，默认 `4`
+- `-callback-qps`：回调全局限速（每秒），`0` 表示不限制
 - `-admin-token`：管理接口鉴权 token（不为空则启用；支持 `Authorization: Bearer ...` 或 `X-Admin-Token`）
 
 ## API 概览
@@ -121,9 +123,11 @@ TRON 生产收款场景一般不需要回填历史入账。
 - `GET /callback-tasks` / `GET /callback-tasks/{id}`：查看回调任务队列
 - `POST /callback-tasks/{id}/retry` / `POST /callback-tasks/retry`：手动重试
 - `GET /stats`：统计信息
+- `GET /metrics`：Prometheus 指标（默认与管理接口同鉴权）
 - `GET/POST/DELETE /mock/transactions`、`GET/POST/DELETE /debug/callbacks`：本地联调接口（生产环境建议通过 `-admin-token` + 网络隔离保护）
 
 完整接口与回调协议见 [docs/API.md](docs/API.md)。
+可观测性与告警建议见 [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)。
 
 ## 回调协议（业务方需要实现）
 

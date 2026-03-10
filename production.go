@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"gorm.io/gorm"
@@ -140,8 +141,49 @@ func (app *App) processDueCallbackTasks(ctx context.Context, limit int) (Callbac
 	}
 
 	result := CallbackTaskRunResult{}
-	for _, task := range tasks {
-		if err := app.deliverCallbackTask(ctx, task); err != nil {
+	if len(tasks) == 0 {
+		return result, nil
+	}
+
+	workers := app.callbackWorkers
+	if workers <= 0 {
+		workers = 1
+	}
+	if workers > len(tasks) {
+		workers = len(tasks)
+	}
+
+	taskCh := make(chan CallbackTask)
+	resCh := make(chan error, len(tasks))
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for task := range taskCh {
+				if app.callbackLimiter != nil {
+					if err := app.callbackLimiter.Wait(ctx); err != nil {
+						resCh <- err
+						continue
+					}
+				}
+				resCh <- app.deliverCallbackTask(ctx, task)
+			}
+		}()
+	}
+
+	go func() {
+		for _, task := range tasks {
+			taskCh <- task
+		}
+		close(taskCh)
+		wg.Wait()
+		close(resCh)
+	}()
+
+	for err := range resCh {
+		if err != nil {
 			result.FailedCallbacks++
 			if errors.Is(err, errCallbackDead) {
 				result.DeadCallbacks++
@@ -501,10 +543,20 @@ func (app *App) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	stats, err := app.collectStats(r.Context())
+	if err != nil {
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, stats)
+}
+
+func (app *App) collectStats(ctx context.Context) (StatsResponse, error) {
 	stats := StatsResponse{}
 	count := func(model any, where string, args ...any) (int64, error) {
 		var total int64
-		query := app.db.WithContext(r.Context()).Model(model)
+		query := app.db.WithContext(ctx).Model(model)
 		if where != "" {
 			query = query.Where(where, args...)
 		}
@@ -516,41 +568,32 @@ func (app *App) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	var err error
 	if stats.WatchedTotal, err = count(&WatchedAddress{}, ""); err != nil {
-		http.Error(w, "database error", http.StatusInternalServerError)
-		return
+		return stats, err
 	}
 	if stats.WatchedEnabled, err = count(&WatchedAddress{}, "enabled = ?", true); err != nil {
-		http.Error(w, "database error", http.StatusInternalServerError)
-		return
+		return stats, err
 	}
 	if stats.WatchedDisabled, err = count(&WatchedAddress{}, "enabled = ?", false); err != nil {
-		http.Error(w, "database error", http.StatusInternalServerError)
-		return
+		return stats, err
 	}
 	if stats.ProcessedTxTotal, err = count(&ProcessedTx{}, ""); err != nil {
-		http.Error(w, "database error", http.StatusInternalServerError)
-		return
+		return stats, err
 	}
 	if stats.CallbackPending, err = count(&CallbackTask{}, "status = ?", "pending"); err != nil {
-		http.Error(w, "database error", http.StatusInternalServerError)
-		return
+		return stats, err
 	}
 	if stats.CallbackRetrying, err = count(&CallbackTask{}, "status = ?", "retrying"); err != nil {
-		http.Error(w, "database error", http.StatusInternalServerError)
-		return
+		return stats, err
 	}
 	if stats.CallbackSuccess, err = count(&CallbackTask{}, "status = ?", "success"); err != nil {
-		http.Error(w, "database error", http.StatusInternalServerError)
-		return
+		return stats, err
 	}
 	if stats.CallbackDead, err = count(&CallbackTask{}, "status = ?", "dead"); err != nil {
-		http.Error(w, "database error", http.StatusInternalServerError)
-		return
+		return stats, err
 	}
 	if stats.DebugCallbacks, err = count(&ReceivedCallback{}, ""); err != nil {
-		http.Error(w, "database error", http.StatusInternalServerError)
-		return
+		return stats, err
 	}
 
-	writeJSON(w, http.StatusOK, stats)
+	return stats, nil
 }

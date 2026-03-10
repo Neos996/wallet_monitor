@@ -6,7 +6,7 @@ import (
 	"errors"
 	"flag"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -284,6 +284,8 @@ type App struct {
 	tronAPIKey         string
 	scanWorkers        int
 	callbackBatch      int
+	callbackWorkers    int
+	callbackLimiter    *RateLimiter
 }
 
 func main() {
@@ -297,21 +299,31 @@ func main() {
 	tronAPIKey := flag.String("tron-api-key", "", "optional TronGrid API key for higher rate limits")
 	scanWorkers := flag.Int("scan-workers", 4, "number of concurrent address scans per tick")
 	callbackBatch := flag.Int("callback-batch", 100, "max callback tasks to process per scan loop")
+	callbackWorkers := flag.Int("callback-workers", 4, "number of concurrent callback deliveries")
+	callbackQPS := flag.Float64("callback-qps", 0, "global callback rate limit (qps); 0 disables")
 	scanInterval := flag.Duration("scan-interval", 15*time.Second, "scan interval")
 	listenAddr := flag.String("listen", ":8080", "HTTP listen address for admin API")
 	flag.Parse()
 
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	slog.SetDefault(logger)
+
 	db, err := gorm.Open(sqlite.Open(*dbPath), &gorm.Config{})
 	if err != nil {
-		log.Fatalf("open db: %v", err)
+		slog.Error("open db failed", "err", err)
+		os.Exit(1)
 	}
 
 	if err := db.AutoMigrate(&WatchedAddress{}, &ProcessedTx{}, &MockIncomingTx{}, &ReceivedCallback{}, &CallbackTask{}); err != nil {
-		log.Fatalf("auto migrate: %v", err)
+		slog.Error("auto migrate failed", "err", err)
+		os.Exit(1)
 	}
 	if err := migrateLegacyIndexes(db); err != nil {
-		log.Fatalf("migrate legacy indexes: %v", err)
+		slog.Error("migrate legacy indexes failed", "err", err)
+		os.Exit(1)
 	}
+
+	callbackLimiter := NewRateLimiter(*callbackQPS)
 
 	app := &App{
 		db:                 db,
@@ -326,18 +338,20 @@ func main() {
 		tronAPIKey:         strings.TrimSpace(*tronAPIKey),
 		scanWorkers:        *scanWorkers,
 		callbackBatch:      *callbackBatch,
+		callbackWorkers:    *callbackWorkers,
+		callbackLimiter:    callbackLimiter,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	if *callbackURL == "" {
-		log.Println("warning: no global callback-url configured; expect per-address callback_url")
+		slog.Warn("no global callback-url configured; expect per-address callback_url")
 	}
 
 	go func() {
 		if err := runScanner(ctx, app, *scanInterval); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("scanner stopped: %v", err)
+			slog.Error("scanner stopped", "err", err)
 		}
 	}()
 
@@ -355,6 +369,7 @@ func main() {
 	mux.HandleFunc("/stats", app.requireAdmin(app.handleStats))
 	mux.HandleFunc("/mock/transactions", app.requireAdmin(app.handleMockTransactions))
 	mux.HandleFunc("/debug/callbacks", app.requireAdmin(app.handleDebugCallbacks))
+	mux.HandleFunc("/metrics", app.requireAdmin(app.handleMetrics))
 
 	server := &http.Server{
 		Addr:    *listenAddr,
@@ -366,17 +381,28 @@ func main() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
-			log.Printf("http server shutdown error: %v", err)
+			slog.Error("http server shutdown error", "err", err)
 		}
 	}()
 
-	log.Printf("wallet monitor started, db=%s interval=%s default-callback=%s rpc=%s listen=%s", *dbPath, scanInterval.String(), *callbackURL, *rpcURL, *listenAddr)
+	slog.Info("wallet monitor started",
+		"db", *dbPath,
+		"interval", scanInterval.String(),
+		"default_callback", *callbackURL,
+		"rpc", *rpcURL,
+		"listen", *listenAddr,
+		"scan_workers", app.scanWorkers,
+		"callback_batch", app.callbackBatch,
+		"callback_workers", app.callbackWorkers,
+		"callback_qps", *callbackQPS,
+	)
 
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatalf("http server error: %v", err)
+		slog.Error("http server error", "err", err)
+		os.Exit(1)
 	}
 
-	log.Println("wallet monitor exited")
+	slog.Info("wallet monitor exited")
 }
 
 func runScanner(ctx context.Context, app *App, interval time.Duration) error {
@@ -393,8 +419,15 @@ func runScanner(ctx context.Context, app *App, interval time.Duration) error {
 		if err != nil {
 			return err
 		}
-		log.Printf("scan complete: addresses=%d txs=%d queued=%d callbacks=%d duplicates=%d failed=%d dead=%d",
-			result.AddressesScanned, result.DetectedTxs, result.QueuedCallbacks, result.CallbacksSent, result.DuplicateTxs, result.FailedCallbacks, result.DeadCallbacks)
+		slog.Info("scan complete",
+			"addresses", result.AddressesScanned,
+			"txs", result.DetectedTxs,
+			"queued", result.QueuedCallbacks,
+			"callbacks", result.CallbacksSent,
+			"duplicates", result.DuplicateTxs,
+			"failed", result.FailedCallbacks,
+			"dead", result.DeadCallbacks,
+		)
 	}
 
 	for {
@@ -404,16 +437,24 @@ func runScanner(ctx context.Context, app *App, interval time.Duration) error {
 		case <-ticker.C:
 			result, err := app.scanOnce(ctx)
 			if err != nil {
-				log.Printf("scan error: %v", err)
+				slog.Error("scan error", "err", err)
 				continue
 			}
-			log.Printf("scan complete: addresses=%d txs=%d queued=%d callbacks=%d duplicates=%d failed=%d dead=%d",
-				result.AddressesScanned, result.DetectedTxs, result.QueuedCallbacks, result.CallbacksSent, result.DuplicateTxs, result.FailedCallbacks, result.DeadCallbacks)
+			slog.Info("scan complete",
+				"addresses", result.AddressesScanned,
+				"txs", result.DetectedTxs,
+				"queued", result.QueuedCallbacks,
+				"callbacks", result.CallbacksSent,
+				"duplicates", result.DuplicateTxs,
+				"failed", result.FailedCallbacks,
+				"dead", result.DeadCallbacks,
+			)
 		}
 	}
 }
 
 func (app *App) scanOnce(ctx context.Context) (ScanResult, error) {
+	startedAt := time.Now()
 	result := ScanResult{ScannedAt: time.Now().UTC()}
 
 	var addresses []WatchedAddress
@@ -476,6 +517,9 @@ func (app *App) scanOnce(ctx context.Context) (ScanResult, error) {
 	result.FailedCallbacks += taskResult.FailedCallbacks
 	result.DeadCallbacks += taskResult.DeadCallbacks
 
+	recordScanMetrics(result, startedAt)
+	app.updateMetrics(ctx)
+
 	return result, nil
 }
 
@@ -484,7 +528,12 @@ func (app *App) scanOneAddress(ctx context.Context, addr WatchedAddress) address
 
 	changed, newHeight, txs, err := app.scanner.ScanAddress(ctx, addr)
 	if err != nil {
-		log.Printf("scan address %s/%s/%s: %v", addr.Chain, addr.Network, addr.Address, err)
+		slog.Error("scan address failed",
+			"chain", addr.Chain,
+			"network", addr.Network,
+			"address", addr.Address,
+			"err", err,
+		)
 		return res
 	}
 	if changed && len(txs) > 0 {
@@ -501,7 +550,7 @@ func (app *App) scanOneAddress(ctx context.Context, addr WatchedAddress) address
 		for _, tx := range txs {
 			processed, err := app.isProcessed(ctx, addr, tx.Hash)
 			if err != nil {
-				log.Printf("check processed tx %s failed: %v", tx.Hash, err)
+				slog.Error("check processed tx failed", "tx_hash", tx.Hash, "err", err)
 				allHandled = false
 				break
 			}
@@ -509,7 +558,7 @@ func (app *App) scanOneAddress(ctx context.Context, addr WatchedAddress) address
 			if processed {
 				res.duplicateTxs++
 				if err := app.markMockDelivered(ctx, addr.Chain, tx.SourceID); err != nil {
-					log.Printf("mark mock tx delivered failed: %v", err)
+					slog.Error("mark mock tx delivered failed", "err", err)
 				}
 				continue
 			}
@@ -519,7 +568,7 @@ func (app *App) scanOneAddress(ctx context.Context, addr WatchedAddress) address
 				callbackURL = app.defaultCallbackURL
 			}
 			if callbackURL == "" {
-				log.Printf("skip tx %s for %s: no callback URL configured", tx.Hash, addr.Address)
+				slog.Warn("skip tx: no callback URL configured", "tx_hash", tx.Hash, "address", addr.Address)
 				res.failedCallbacks++
 				allHandled = false
 				break
@@ -527,7 +576,7 @@ func (app *App) scanOneAddress(ctx context.Context, addr WatchedAddress) address
 
 			created, err := app.enqueueCallbackTask(ctx, addr, callbackURL, tx)
 			if err != nil {
-				log.Printf("enqueue callback tx %s failed: %v", tx.Hash, err)
+				slog.Error("enqueue callback tx failed", "tx_hash", tx.Hash, "err", err)
 				res.failedCallbacks++
 				allHandled = false
 				break
@@ -539,7 +588,7 @@ func (app *App) scanOneAddress(ctx context.Context, addr WatchedAddress) address
 			}
 
 			if err := app.markMockDelivered(ctx, addr.Chain, tx.SourceID); err != nil {
-				log.Printf("mark mock tx delivered failed: %v", err)
+				slog.Error("mark mock tx delivered failed", "err", err)
 				allHandled = false
 				break
 			}
@@ -555,7 +604,7 @@ func (app *App) scanOneAddress(ctx context.Context, addr WatchedAddress) address
 			Model(&WatchedAddress{}).
 			Where("id = ?", addr.ID).
 			Update("last_seen_height", newHeight).Error; err != nil {
-			log.Printf("update last_seen_height for %s failed: %v", addr.Address, err)
+			slog.Error("update last_seen_height failed", "address", addr.Address, "err", err)
 			return res
 		}
 		res.updatedAddresses++
