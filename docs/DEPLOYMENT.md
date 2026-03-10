@@ -16,6 +16,8 @@
   -callback-batch 100 \
   -callback-workers 4 \
   -callback-qps 0 \
+  -callback-retry-4xx false \
+  -callback-retry-statuses 409,425 \
   -admin-token <ADMIN_TOKEN> \
   -callback-secret <CALLBACK_SECRET>
 ```
@@ -49,7 +51,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/wallet_monitor
-ExecStart=/opt/wallet_monitor/wallet_monitor -listen :8080 -db /var/lib/wallet_monitor/wallets.db -scan-interval 30s -scan-workers 4 -rpc-url https://api.trongrid.io -tron-api-key <TRON_PRO_API_KEY> -callback-url https://business.example.com/wallet/callback -callback-batch 100 -callback-workers 4 -callback-qps 0 -admin-token <ADMIN_TOKEN> -callback-secret <CALLBACK_SECRET>
+ExecStart=/opt/wallet_monitor/wallet_monitor -listen :8080 -db /var/lib/wallet_monitor/wallets.db -scan-interval 30s -scan-workers 4 -rpc-url https://api.trongrid.io -tron-api-key <TRON_PRO_API_KEY> -callback-url https://business.example.com/wallet/callback -callback-batch 100 -callback-workers 4 -callback-qps 0 -callback-retry-4xx false -callback-retry-statuses 409,425 -admin-token <ADMIN_TOKEN> -callback-secret <CALLBACK_SECRET>
 Restart=always
 RestartSec=3
 

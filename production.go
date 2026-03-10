@@ -4,11 +4,13 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -36,6 +38,8 @@ type CallbackTask struct {
 	LastAttemptAt *time.Time `json:"last_attempt_at"`
 	DeliveredAt   *time.Time `json:"delivered_at"`
 	LastError     string     `gorm:"type:text" json:"last_error"`
+	LastErrorType string     `gorm:"size:32" json:"last_error_type"`
+	LastStatus    int        `json:"last_status_code"`
 	CreatedAt     time.Time  `json:"created_at"`
 	UpdatedAt     time.Time  `json:"updated_at"`
 }
@@ -44,6 +48,29 @@ type CallbackTaskRunResult struct {
 	CallbacksSent   int `json:"callbacks_sent"`
 	FailedCallbacks int `json:"failed_callbacks"`
 	DeadCallbacks   int `json:"dead_callbacks"`
+}
+
+type CallbackError struct {
+	Kind       string
+	StatusCode int
+	Err        error
+}
+
+func (e *CallbackError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.StatusCode > 0 {
+		return fmt.Sprintf("%s (status=%d): %v", e.Kind, e.StatusCode, e.Err)
+	}
+	return fmt.Sprintf("%s: %v", e.Kind, e.Err)
+}
+
+func (e *CallbackError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
 }
 
 type UpdateAddressRequest struct {
@@ -201,10 +228,11 @@ var errCallbackDead = errors.New("callback task moved to dead state")
 func (app *App) deliverCallbackTask(ctx context.Context, task CallbackTask) error {
 	now := time.Now().UTC()
 	if err := app.sendCallbackBody(ctx, task.CallbackURL, task.Payload, task.ID); err != nil {
+		cbErr := asCallbackError(err)
 		nextRetryCount := task.RetryCount + 1
 		status := "retrying"
 		nextRetryAt := now.Add(calculateRetryDelay(app.callbackRetryBase, nextRetryCount))
-		if nextRetryCount >= task.MaxRetries {
+		if !app.shouldRetryCallback(cbErr, nextRetryCount, task.MaxRetries) {
 			status = "dead"
 		}
 
@@ -214,6 +242,8 @@ func (app *App) deliverCallbackTask(ctx context.Context, task CallbackTask) erro
 			"next_retry_at":   nextRetryAt,
 			"last_attempt_at": now,
 			"last_error":      err.Error(),
+			"last_error_type": cbErr.Kind,
+			"last_status":     cbErr.StatusCode,
 		}
 		if dbErr := app.db.WithContext(ctx).Model(&CallbackTask{}).Where("id = ?", task.ID).Updates(update).Error; dbErr != nil {
 			return dbErr
@@ -253,7 +283,7 @@ func (app *App) deliverCallbackTask(ctx context.Context, task CallbackTask) erro
 func (app *App) sendCallbackBody(ctx context.Context, callbackURL, payload string, taskID uint64) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, callbackURL, strings.NewReader(payload))
 	if err != nil {
-		return err
+		return &CallbackError{Kind: "request", Err: err}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-WalletMonitor-Event-ID", strconv.FormatUint(taskID, 10))
@@ -266,16 +296,64 @@ func (app *App) sendCallbackBody(ctx context.Context, callbackURL, payload strin
 
 	resp, err := app.httpClient.Do(req)
 	if err != nil {
-		return err
+		if errors.Is(err, context.DeadlineExceeded) {
+			return &CallbackError{Kind: "timeout", Err: err}
+		}
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			return &CallbackError{Kind: "timeout", Err: err}
+		}
+		if errors.Is(err, context.Canceled) {
+			return &CallbackError{Kind: "context", Err: err}
+		}
+		return &CallbackError{Kind: "transport", Err: err}
 	}
 	defer resp.Body.Close()
 
 	_, _ = io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("callback returned status %s", resp.Status)
+		return &CallbackError{Kind: "non_2xx", StatusCode: resp.StatusCode, Err: fmt.Errorf("callback returned status %s", resp.Status)}
 	}
 
 	return nil
+}
+
+func asCallbackError(err error) *CallbackError {
+	if err == nil {
+		return &CallbackError{Kind: "none"}
+	}
+	var cbErr *CallbackError
+	if errors.As(err, &cbErr) && cbErr != nil {
+		return cbErr
+	}
+	return &CallbackError{Kind: "unknown", Err: err}
+}
+
+func (app *App) shouldRetryCallback(err *CallbackError, retryCount, maxRetries int) bool {
+	if retryCount >= maxRetries {
+		return false
+	}
+	if err == nil {
+		return false
+	}
+
+	switch err.Kind {
+	case "timeout", "transport", "context":
+		return true
+	case "non_2xx":
+		code := err.StatusCode
+		if code >= 500 || code == 408 || code == 429 {
+			return true
+		}
+		if app.retryOn4xx && code >= 400 && code < 500 {
+			return true
+		}
+		if app.retryStatusCodes != nil && app.retryStatusCodes[code] {
+			return true
+		}
+		return false
+	default:
+		return true
+	}
 }
 
 func signCallbackPayload(secret, timestamp, payload string) string {
@@ -485,6 +563,64 @@ func (app *App) handleRetryCallbackTasks(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+func (app *App) handleExportDeadCallbackTasks(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
+	if format == "" {
+		format = "json"
+	}
+
+	var tasks []CallbackTask
+	if err := app.db.WithContext(r.Context()).
+		Where("status = ?", "dead").
+		Order("id asc").
+		Find(&tasks).Error; err != nil {
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
+	}
+
+	switch format {
+	case "csv":
+		w.Header().Set("Content-Type", "text/csv")
+		w.Header().Set("Content-Disposition", "attachment; filename=\"dead_callback_tasks.csv\"")
+		writer := csv.NewWriter(w)
+		_ = writer.Write([]string{
+			"id", "chain", "network", "address", "asset_type", "token_contract",
+			"tx_hash", "block_height", "callback_url", "status", "retry_count", "max_retries",
+			"last_error_type", "last_status_code", "last_error", "created_at", "updated_at",
+		})
+		for _, task := range tasks {
+			_ = writer.Write([]string{
+				strconv.FormatUint(task.ID, 10),
+				task.Chain,
+				task.Network,
+				task.Address,
+				task.AssetType,
+				task.TokenContract,
+				task.TxHash,
+				strconv.FormatUint(task.BlockHeight, 10),
+				task.CallbackURL,
+				task.Status,
+				strconv.Itoa(task.RetryCount),
+				strconv.Itoa(task.MaxRetries),
+				task.LastErrorType,
+				strconv.Itoa(task.LastStatus),
+				task.LastError,
+				task.CreatedAt.Format(time.RFC3339),
+				task.UpdatedAt.Format(time.RFC3339),
+			})
+		}
+		writer.Flush()
+		return
+	default:
+		writeJSON(w, http.StatusOK, tasks)
+	}
 }
 
 func (app *App) handleCallbackTaskByID(w http.ResponseWriter, r *http.Request) {

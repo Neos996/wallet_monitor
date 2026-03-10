@@ -124,6 +124,16 @@
 - `POST /callback-tasks/{id}/retry`：重试单条
 - `POST /callback-tasks/retry`：批量重试（`retrying` / `dead` -> `retrying`）
 
+### 5.4 死信导出
+
+`GET /callback-tasks/dead/export`
+
+可选参数：
+
+- `format=csv`：导出 CSV
+
+默认返回 JSON 数组。
+
 ## 6. 统计信息
 
 `GET /stats`
@@ -207,6 +217,24 @@ printf "%s.%s" "$timestamp" "$payload" \
   | openssl dgst -sha256 -hmac "$secret" -hex \
   | awk '{print $2}'
 ```
+
+### 8.5 回调失败分类与重试策略
+
+回调失败会记录到 `CallbackTask` 的以下字段：
+
+- `last_error_type`：`timeout` / `transport` / `context` / `non_2xx` / `request` / `unknown`
+- `last_status_code`：HTTP 状态码（仅当 `non_2xx`）
+- `last_error`：原始错误信息
+
+默认重试策略：
+
+- `timeout` / `transport` / `context`：重试
+- `non_2xx`：仅对 `5xx`、`408`、`429` 重试
+
+可通过参数调整：
+
+- `-callback-retry-4xx`：对所有 `4xx` 进行重试
+- `-callback-retry-statuses`：逗号分隔的额外状态码列表（例如 `409,425`）
 
 ### 8.4 成功响应
 

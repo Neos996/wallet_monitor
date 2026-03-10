@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -286,6 +287,8 @@ type App struct {
 	callbackBatch      int
 	callbackWorkers    int
 	callbackLimiter    *RateLimiter
+	retryOn4xx         bool
+	retryStatusCodes   map[int]bool
 }
 
 func main() {
@@ -301,6 +304,8 @@ func main() {
 	callbackBatch := flag.Int("callback-batch", 100, "max callback tasks to process per scan loop")
 	callbackWorkers := flag.Int("callback-workers", 4, "number of concurrent callback deliveries")
 	callbackQPS := flag.Float64("callback-qps", 0, "global callback rate limit (qps); 0 disables")
+	callbackRetryOn4xx := flag.Bool("callback-retry-4xx", false, "retry callbacks on 4xx responses")
+	callbackRetryStatuses := flag.String("callback-retry-statuses", "", "comma-separated HTTP status codes to always retry (e.g. 409,425)")
 	scanInterval := flag.Duration("scan-interval", 15*time.Second, "scan interval")
 	listenAddr := flag.String("listen", ":8080", "HTTP listen address for admin API")
 	flag.Parse()
@@ -325,6 +330,8 @@ func main() {
 
 	callbackLimiter := NewRateLimiter(*callbackQPS)
 
+	retryStatusCodes := parseRetryStatusCodes(*callbackRetryStatuses)
+
 	app := &App{
 		db:                 db,
 		scanner:            &MultiClient{db: db, rpcURL: *rpcURL, tronAPIKey: *tronAPIKey},
@@ -340,6 +347,8 @@ func main() {
 		callbackBatch:      *callbackBatch,
 		callbackWorkers:    *callbackWorkers,
 		callbackLimiter:    callbackLimiter,
+		retryOn4xx:         *callbackRetryOn4xx,
+		retryStatusCodes:   retryStatusCodes,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -366,6 +375,7 @@ func main() {
 	mux.HandleFunc("/callback-tasks", app.requireAdmin(app.handleCallbackTasks))
 	mux.HandleFunc("/callback-tasks/", app.requireAdmin(app.handleCallbackTaskByID))
 	mux.HandleFunc("/callback-tasks/retry", app.requireAdmin(app.handleRetryCallbackTasks))
+	mux.HandleFunc("/callback-tasks/dead/export", app.requireAdmin(app.handleExportDeadCallbackTasks))
 	mux.HandleFunc("/stats", app.requireAdmin(app.handleStats))
 	mux.HandleFunc("/mock/transactions", app.requireAdmin(app.handleMockTransactions))
 	mux.HandleFunc("/debug/callbacks", app.requireAdmin(app.handleDebugCallbacks))
@@ -395,6 +405,8 @@ func main() {
 		"callback_batch", app.callbackBatch,
 		"callback_workers", app.callbackWorkers,
 		"callback_qps", *callbackQPS,
+		"callback_retry_4xx", *callbackRetryOn4xx,
+		"callback_retry_statuses", *callbackRetryStatuses,
 	)
 
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -1022,4 +1034,20 @@ func normalizeTronAddress(address string) (string, error) {
 	}
 
 	return tronclient.HexToAddress(hexAddress)
+}
+
+func parseRetryStatusCodes(input string) map[int]bool {
+	result := map[int]bool{}
+	for _, raw := range strings.Split(input, ",") {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			continue
+		}
+		code, err := strconv.Atoi(value)
+		if err != nil || code <= 0 {
+			continue
+		}
+		result[code] = true
+	}
+	return result
 }
