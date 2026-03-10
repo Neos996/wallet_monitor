@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"net/http"
 	"os"
 	"os/signal"
@@ -19,6 +21,7 @@ import (
 
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
+	evmclient "wallet_monitor/internal/evm"
 	tronclient "wallet_monitor/internal/tron"
 )
 
@@ -149,11 +152,13 @@ type BlockchainClient interface {
 }
 
 type MultiClient struct {
-	db         *gorm.DB
-	rpcURL     string
-	tronAPIKey string
-	tronQPS    float64
-	tronRetry  int
+	db          *gorm.DB
+	rpcURL      string
+	tronAPIKey  string
+	tronQPS     float64
+	tronRetry   int
+	evmRPCURL   string
+	evmLogRange uint64
 }
 
 func (c *MultiClient) ScanAddress(ctx context.Context, watched WatchedAddress) (bool, uint64, []Tx, error) {
@@ -162,9 +167,11 @@ func (c *MultiClient) ScanAddress(ctx context.Context, watched WatchedAddress) (
 		return c.scanMockAddress(ctx, watched)
 	case "tron":
 		return c.scanTronAddress(ctx, watched)
+	case "evm":
+		return c.scanEVMAddress(ctx, watched)
 	}
 
-	return false, watched.LastSeenHeight, nil, errors.New("chain adapter not implemented; supported now: chain=mock for local validation, chain=tron for confirmed TRX and TRC20 transfers")
+	return false, watched.LastSeenHeight, nil, errors.New("chain adapter not implemented; supported now: chain=mock for local validation, chain=tron for confirmed TRX and TRC20 transfers, chain=evm for ERC20 logs")
 }
 
 func (c *MultiClient) scanMockAddress(ctx context.Context, watched WatchedAddress) (bool, uint64, []Tx, error) {
@@ -273,6 +280,98 @@ func (c *MultiClient) scanTronAddress(ctx context.Context, watched WatchedAddres
 	}
 }
 
+const evmTransferTopic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+func (c *MultiClient) scanEVMAddress(ctx context.Context, watched WatchedAddress) (bool, uint64, []Tx, error) {
+	if c.evmRPCURL == "" {
+		return false, watched.LastSeenHeight, nil, errors.New("evm rpc url not configured; use -evm-rpc-url")
+	}
+	if watched.AssetType != "erc20" {
+		return false, watched.LastSeenHeight, nil, errors.New("unsupported evm asset type; supported: erc20")
+	}
+	if watched.TokenContract == "" {
+		return false, watched.LastSeenHeight, nil, errors.New("token_contract is required for evm erc20 watcher")
+	}
+
+	contract, err := normalizeEVMAddress(watched.TokenContract)
+	if err != nil {
+		return false, watched.LastSeenHeight, nil, err
+	}
+	target, err := normalizeEVMAddress(watched.Address)
+	if err != nil {
+		return false, watched.LastSeenHeight, nil, err
+	}
+
+	client := evmclient.NewClient(c.evmRPCURL)
+	blockHex, err := client.GetBlockNumber(ctx)
+	if err != nil {
+		return false, watched.LastSeenHeight, nil, err
+	}
+	currentBlock, err := parseHexUint64(blockHex)
+	if err != nil {
+		return false, watched.LastSeenHeight, nil, err
+	}
+	confirmedCutoff := calculateConfirmedCutoff(currentBlock, watched.MinConfirmations)
+
+	newHeight := watched.LastSeenHeight
+	if confirmedCutoff > newHeight {
+		newHeight = confirmedCutoff
+	}
+
+	if confirmedCutoff <= watched.LastSeenHeight {
+		return newHeight > watched.LastSeenHeight, newHeight, nil, nil
+	}
+
+	from := watched.LastSeenHeight + 1
+	to := confirmedCutoff
+	step := c.evmLogRange
+	if step == 0 {
+		step = 2000
+	}
+
+	txs := make([]Tx, 0)
+	for start := from; start <= to; start += step {
+		end := start + step - 1
+		if end > to {
+			end = to
+		}
+
+		filter := map[string]any{
+			"fromBlock": fmt.Sprintf("0x%x", start),
+			"toBlock":   fmt.Sprintf("0x%x", end),
+			"address":   contract,
+			"topics":    []any{evmTransferTopic, nil, padTopicAddress(target)},
+		}
+
+		logs, err := client.GetLogs(ctx, filter)
+		if err != nil {
+			return false, watched.LastSeenHeight, nil, err
+		}
+
+		for _, logRow := range logs {
+			if len(logRow.Topics) < 3 {
+				continue
+			}
+			blockNumber, err := parseHexUint64(logRow.BlockNumber)
+			if err != nil {
+				continue
+			}
+			amount := parseHexBigInt(logRow.Data)
+			txs = append(txs, Tx{
+				Hash:          logRow.TransactionHash,
+				From:          topicToAddress(logRow.Topics[1]),
+				To:            topicToAddress(logRow.Topics[2]),
+				Amount:        amount.String(),
+				BlockHeight:   blockNumber,
+				AssetType:     "erc20",
+				TokenContract: contract,
+			})
+		}
+	}
+
+	return len(txs) > 0 || newHeight > watched.LastSeenHeight, newHeight, txs, nil
+}
+
 func (c *MultiClient) resolveTronAPIURL(network string) string {
 	return resolveTronAPIURL(c.rpcURL, network)
 }
@@ -288,6 +387,7 @@ type App struct {
 	adminToken         string
 	rpcURL             string
 	tronAPIKey         string
+	evmRPCURL          string
 	scanWorkers        int
 	callbackBatch      int
 	callbackWorkers    int
@@ -307,6 +407,8 @@ func main() {
 	tronAPIKey := flag.String("tron-api-key", "", "optional TronGrid API key for higher rate limits")
 	tronQPS := flag.Float64("tron-qps", 8, "global Tron API QPS limit (0 disables)")
 	tronRetry429 := flag.Int("tron-retry-429", 3, "number of retries for HTTP 429 from Tron API")
+	evmRPCURL := flag.String("evm-rpc-url", "", "EVM JSON-RPC endpoint for chain=evm")
+	evmLogRange := flag.Uint64("evm-log-range", 2000, "max block range per EVM log query")
 	scanWorkers := flag.Int("scan-workers", 4, "number of concurrent address scans per tick")
 	callbackBatch := flag.Int("callback-batch", 100, "max callback tasks to process per scan loop")
 	callbackWorkers := flag.Int("callback-workers", 4, "number of concurrent callback deliveries")
@@ -340,8 +442,16 @@ func main() {
 	retryStatusCodes := parseRetryStatusCodes(*callbackRetryStatuses)
 
 	app := &App{
-		db:                 db,
-		scanner:            &MultiClient{db: db, rpcURL: *rpcURL, tronAPIKey: *tronAPIKey, tronQPS: *tronQPS, tronRetry: *tronRetry429},
+		db: db,
+		scanner: &MultiClient{
+			db:          db,
+			rpcURL:      *rpcURL,
+			tronAPIKey:  *tronAPIKey,
+			tronQPS:     *tronQPS,
+			tronRetry:   *tronRetry429,
+			evmRPCURL:   *evmRPCURL,
+			evmLogRange: *evmLogRange,
+		},
 		defaultCallbackURL: *callbackURL,
 		httpClient:         &http.Client{Timeout: 10 * time.Second},
 		callbackSecret:     *callbackSecret,
@@ -350,6 +460,7 @@ func main() {
 		adminToken:         strings.TrimSpace(*adminToken),
 		rpcURL:             strings.TrimSpace(*rpcURL),
 		tronAPIKey:         strings.TrimSpace(*tronAPIKey),
+		evmRPCURL:          strings.TrimSpace(*evmRPCURL),
 		scanWorkers:        *scanWorkers,
 		callbackBatch:      *callbackBatch,
 		callbackWorkers:    *callbackWorkers,
@@ -409,6 +520,8 @@ func main() {
 		"rpc", *rpcURL,
 		"tron_qps", *tronQPS,
 		"tron_retry_429", *tronRetry429,
+		"evm_rpc", *evmRPCURL,
+		"evm_log_range", *evmLogRange,
 		"listen", *listenAddr,
 		"scan_workers", app.scanWorkers,
 		"callback_batch", app.callbackBatch,
@@ -741,7 +854,11 @@ func (app *App) createAddress(w http.ResponseWriter, r *http.Request) {
 		req.Chain = "tron"
 	}
 	if req.AssetType == "" {
-		req.AssetType = "native"
+		if strings.ToLower(req.Chain) == "evm" {
+			req.AssetType = "erc20"
+		} else {
+			req.AssetType = "native"
+		}
 	}
 	if req.MinConfirmations <= 0 {
 		req.MinConfirmations = 1
@@ -758,14 +875,14 @@ func (app *App) createAddress(w http.ResponseWriter, r *http.Request) {
 	req.AssetType = strings.ToLower(req.AssetType)
 	req.TokenContract = strings.TrimSpace(req.TokenContract)
 
-	switch req.AssetType {
-	case "native", "trc20":
-	default:
-		http.Error(w, "unsupported asset_type", http.StatusBadRequest)
-		return
-	}
-
-	if req.Chain == "tron" {
+	switch req.Chain {
+	case "tron":
+		switch req.AssetType {
+		case "native", "trc20":
+		default:
+			http.Error(w, "unsupported tron asset_type", http.StatusBadRequest)
+			return
+		}
 		normalizedAddress, err := normalizeTronAddress(req.Address)
 		if err != nil {
 			http.Error(w, "invalid tron address", http.StatusBadRequest)
@@ -780,10 +897,40 @@ func (app *App) createAddress(w http.ResponseWriter, r *http.Request) {
 			}
 			req.TokenContract = normalizedContract
 		}
-	}
-
-	if req.Chain == "tron" && req.AssetType == "trc20" && req.TokenContract == "" {
-		http.Error(w, "token_contract is required for tron trc20 watcher", http.StatusBadRequest)
+		if req.AssetType == "trc20" && req.TokenContract == "" {
+			http.Error(w, "token_contract is required for tron trc20 watcher", http.StatusBadRequest)
+			return
+		}
+	case "evm":
+		if req.AssetType != "erc20" {
+			http.Error(w, "unsupported evm asset_type; supported: erc20", http.StatusBadRequest)
+			return
+		}
+		normalizedAddress, err := normalizeEVMAddress(req.Address)
+		if err != nil {
+			http.Error(w, "invalid evm address", http.StatusBadRequest)
+			return
+		}
+		req.Address = normalizedAddress
+		if req.TokenContract == "" {
+			http.Error(w, "token_contract is required for evm erc20 watcher", http.StatusBadRequest)
+			return
+		}
+		normalizedContract, err := normalizeEVMAddress(req.TokenContract)
+		if err != nil {
+			http.Error(w, "invalid evm token_contract", http.StatusBadRequest)
+			return
+		}
+		req.TokenContract = normalizedContract
+	case "mock":
+		switch req.AssetType {
+		case "native", "trc20", "erc20":
+		default:
+			http.Error(w, "unsupported mock asset_type", http.StatusBadRequest)
+			return
+		}
+	default:
+		http.Error(w, "unsupported chain", http.StatusBadRequest)
 		return
 	}
 
@@ -798,6 +945,23 @@ func (app *App) createAddress(w http.ResponseWriter, r *http.Request) {
 		currentBlock, err := client.GetNowBlockNumber(r.Context())
 		if err != nil {
 			http.Error(w, "unable to resolve start_height from tron rpc (provide start_height explicitly or check rpc-url)", http.StatusBadGateway)
+			return
+		}
+		startHeight = calculateConfirmedCutoff(currentBlock, req.MinConfirmations)
+	} else if req.Chain == "evm" {
+		if app.evmRPCURL == "" {
+			http.Error(w, "evm rpc url not configured; provide -evm-rpc-url or start_height explicitly", http.StatusBadGateway)
+			return
+		}
+		client := evmclient.NewClient(app.evmRPCURL)
+		blockHex, err := client.GetBlockNumber(r.Context())
+		if err != nil {
+			http.Error(w, "unable to resolve start_height from evm rpc (provide start_height explicitly or check evm-rpc-url)", http.StatusBadGateway)
+			return
+		}
+		currentBlock, err := parseHexUint64(blockHex)
+		if err != nil {
+			http.Error(w, "invalid evm block number from rpc", http.StatusBadGateway)
 			return
 		}
 		startHeight = calculateConfirmedCutoff(currentBlock, req.MinConfirmations)
@@ -1043,6 +1207,79 @@ func normalizeTronAddress(address string) (string, error) {
 	}
 
 	return tronclient.HexToAddress(hexAddress)
+}
+
+func normalizeEVMAddress(address string) (string, error) {
+	value := strings.ToLower(strings.TrimSpace(address))
+	if value == "" {
+		return "", errors.New("empty evm address")
+	}
+	if !strings.HasPrefix(value, "0x") {
+		value = "0x" + value
+	}
+	if len(value) != 42 {
+		return "", errors.New("invalid evm address length")
+	}
+	if !isHexString(value[2:]) {
+		return "", errors.New("invalid evm address hex")
+	}
+	return value, nil
+}
+
+func padTopicAddress(address string) string {
+	value := strings.ToLower(strings.TrimSpace(address))
+	value = strings.TrimPrefix(value, "0x")
+	if len(value) > 40 {
+		value = value[len(value)-40:]
+	}
+	return "0x" + strings.Repeat("0", 64-len(value)) + value
+}
+
+func topicToAddress(topic string) string {
+	value := strings.ToLower(strings.TrimSpace(topic))
+	value = strings.TrimPrefix(value, "0x")
+	if len(value) > 40 {
+		value = value[len(value)-40:]
+	}
+	return "0x" + value
+}
+
+func parseHexUint64(value string) (uint64, error) {
+	value = strings.TrimSpace(value)
+	value = strings.TrimPrefix(value, "0x")
+	if value == "" {
+		return 0, nil
+	}
+	return strconv.ParseUint(value, 16, 64)
+}
+
+func parseHexBigInt(value string) *big.Int {
+	text := strings.TrimSpace(value)
+	text = strings.TrimPrefix(text, "0x")
+	if text == "" {
+		return big.NewInt(0)
+	}
+	result := new(big.Int)
+	if _, ok := result.SetString(text, 16); !ok {
+		return big.NewInt(0)
+	}
+	return result
+}
+
+func isHexString(input string) bool {
+	if input == "" {
+		return false
+	}
+	for _, r := range input {
+		switch {
+		case r >= '0' && r <= '9':
+		case r >= 'a' && r <= 'f':
+		case r >= 'A' && r <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func parseRetryStatusCodes(input string) map[int]bool {

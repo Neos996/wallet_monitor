@@ -14,6 +14,8 @@
   -tron-api-key <TRON_PRO_API_KEY> \
   -tron-qps 8 \
   -tron-retry-429 3 \
+  -evm-rpc-url https://your-evm-rpc \
+  -evm-log-range 2000 \
   -callback-url https://business.example.com/wallet/callback \
   -callback-batch 100 \
   -callback-workers 4 \

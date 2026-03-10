@@ -57,11 +57,12 @@
 说明：
 
 - `chain` 默认 `tron`；`network` 默认 `mainnet`（`mock` 则默认 `local`）。
-- `asset_type` 支持 `native` / `trc20`。
-- `token_contract` 仅 `trc20` 必填。
+- `asset_type` 支持 `native` / `trc20` / `erc20`（`chain=evm` 时仅支持 `erc20`）。
+- `token_contract` 在 `trc20` / `erc20` 时必填。
 - `min_confirmations` 用于确认数判断（只回调达到确认数的交易）。
 - `start_height` 可选：控制 `last_seen_height` 初始值。  
   `chain=tron` 且不传时，会自动设置为“当前已确认高度”（基于 `min_confirmations` 的 confirmed cutoff），避免历史回填。
+  `chain=evm` 同理（需配置 `-evm-rpc-url`）。
 
 响应：`201 Created`，返回创建后的 `WatchedAddress`。
 
@@ -183,6 +184,10 @@ Prometheus 指标（默认与管理接口同鉴权）。指标清单见 [OBSERVA
   "block_height": 80738571
 }
 ```
+
+说明：
+
+- `chain=evm` 的 `amount` 为原始整数（不带 decimals），需业务侧按 token decimals 换算。
 
 ### 8.2 幂等与事件 ID
 

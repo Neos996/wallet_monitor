@@ -13,6 +13,7 @@
 
 - `chain=mock`：本地闭环联调（注入假交易 -> 扫描 -> 回调 -> 去重）。
 - `chain=tron`：`mainnet | shasta | nile` 的已确认 `TRX(native)` / `TRC20` 入账扫描。
+- `chain=evm`：`ERC20` 按地址日志查询入账（回调金额为原始整数，需业务侧按 token decimals 处理）。
 - `min_confirmations`：最小确认数控制（只回调达到确认数的交易）。
 - 回调持久化任务队列：`CallbackTask` + 指数退避重试 + `dead` 状态。
 - 幂等去重：回调成功后写入 `ProcessedTx`，避免重复通知。
@@ -106,6 +107,8 @@ TRON 生产收款场景一般不需要回填历史入账。
 - `-tron-api-key`：TronGrid API key（建议生产必配，降低 429 风险）
 - `-tron-qps`：Tron API 全局 QPS 限制，默认 `8`（`0` 表示不限制）
 - `-tron-retry-429`：遇到 HTTP 429 时的指数退避重试次数，默认 `3`
+- `-evm-rpc-url`：EVM JSON-RPC 地址（`chain=evm` 必填）
+- `-evm-log-range`：EVM 单次日志查询最大区块范围，默认 `2000`
 - `-callback-url`：默认回调地址（可被单地址 `callback_url` 覆盖）
 - `-callback-secret`：回调签名 HMAC secret（不为空则启用签名）
 - `-callback-retry-base`：回调失败重试基准间隔（指数退避基数），默认 `10s`
