@@ -54,14 +54,14 @@ sequenceDiagram
       D-->>S: Already exists
       S-->>S: Skip enqueue
     else new valid incoming tx
-      S->>D: Insert CallbackTask (unique; pending; next_retry_at=now)
+      S->>D: Insert CallbackTask (unique, status=pending, next_retry_at=now)
       D-->>S: Created or duplicate
       S->>D: Update WatchedAddress.last_seen_height
     end
   end
 
   Note right of S: 本轮扫描结束后，处理到期回调任务
-  S->>D: Load due CallbackTask (pending/retrying; next_retry_at <= now)
+  S->>D: Load due CallbackTask (status=pending/retrying, next_retry_at is due)
   D-->>S: Task list
 
   loop each callback task
@@ -69,7 +69,7 @@ sequenceDiagram
     alt callback returns 2xx
       H-->>S: ACK
       Note right of H: 业务侧匹配订单，更新支付状态与账务
-      S->>D: Update task status=success; Insert ProcessedTx
+      S->>D: Update task status=success, insert ProcessedTx
     else callback timeout / non-2xx
       H-->>S: Error
       S->>D: Update task status=retrying/dead (backoff + last_error)
