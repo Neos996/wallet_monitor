@@ -138,6 +138,7 @@ TRON 生产收款场景一般不需要回填历史入账。
 
 完整接口与回调协议见 [docs/API.md](docs/API.md)。
 可观测性与告警建议见 [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)。
+EVM 按区块高度爬块（`-evm-scan-mode block`）原理见 [docs/EVM_BLOCK_SCAN.md](docs/EVM_BLOCK_SCAN.md)。
 
 ## 回调协议（业务方需要实现）
 
