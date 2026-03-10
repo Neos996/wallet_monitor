@@ -53,6 +53,11 @@ increase(wallet_monitor_callback_tasks{status="pending"}[10m]) > 0
 histogram_quantile(0.95, rate(wallet_monitor_scan_duration_seconds_bucket[5m])) > 10
 ```
 
+TRON 429 频发（需结合日志）：
+
+- 日志中 `scan address failed` 或 `scan error` 与 `status=429` 频繁出现。
+- 处理方式：降低 `-scan-workers`，配置 `-tron-api-key`，并调低 `-tron-qps` 或增加 `-tron-retry-429`。
+
 ## 3. 日志建议
 
 日志使用 JSON 结构化输出，关键事件包含：
@@ -66,4 +71,3 @@ histogram_quantile(0.95, rate(wallet_monitor_scan_duration_seconds_bucket[5m])) 
 - `scan error` 或 `scan address failed` 连续出现
 - `callback` 错误与 `dead` 计数同步上升
 - 扫描耗时显著增加（对比常态）
-

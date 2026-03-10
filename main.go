@@ -152,6 +152,8 @@ type MultiClient struct {
 	db         *gorm.DB
 	rpcURL     string
 	tronAPIKey string
+	tronQPS    float64
+	tronRetry  int
 }
 
 func (c *MultiClient) ScanAddress(ctx context.Context, watched WatchedAddress) (bool, uint64, []Tx, error) {
@@ -201,7 +203,10 @@ func (c *MultiClient) scanMockAddress(ctx context.Context, watched WatchedAddres
 
 func (c *MultiClient) scanTronAddress(ctx context.Context, watched WatchedAddress) (bool, uint64, []Tx, error) {
 	apiURL := c.resolveTronAPIURL(strings.ToLower(watched.Network))
-	client := tronclient.NewClient(apiURL).WithAPIKey(c.tronAPIKey)
+	client := tronclient.NewClient(apiURL).
+		WithAPIKey(c.tronAPIKey).
+		WithRateLimiter(tronclient.NewRateLimiter(c.tronQPS)).
+		WithRetry429(c.tronRetry, 500*time.Millisecond)
 	currentBlock, err := client.GetNowBlockNumber(ctx)
 	if err != nil {
 		return false, watched.LastSeenHeight, nil, err
@@ -300,6 +305,8 @@ func main() {
 	adminToken := flag.String("admin-token", "", "optional bearer token to protect admin APIs (Authorization: Bearer ... or X-Admin-Token)")
 	rpcURL := flag.String("rpc-url", "", "blockchain RPC endpoint")
 	tronAPIKey := flag.String("tron-api-key", "", "optional TronGrid API key for higher rate limits")
+	tronQPS := flag.Float64("tron-qps", 8, "global Tron API QPS limit (0 disables)")
+	tronRetry429 := flag.Int("tron-retry-429", 3, "number of retries for HTTP 429 from Tron API")
 	scanWorkers := flag.Int("scan-workers", 4, "number of concurrent address scans per tick")
 	callbackBatch := flag.Int("callback-batch", 100, "max callback tasks to process per scan loop")
 	callbackWorkers := flag.Int("callback-workers", 4, "number of concurrent callback deliveries")
@@ -334,7 +341,7 @@ func main() {
 
 	app := &App{
 		db:                 db,
-		scanner:            &MultiClient{db: db, rpcURL: *rpcURL, tronAPIKey: *tronAPIKey},
+		scanner:            &MultiClient{db: db, rpcURL: *rpcURL, tronAPIKey: *tronAPIKey, tronQPS: *tronQPS, tronRetry: *tronRetry429},
 		defaultCallbackURL: *callbackURL,
 		httpClient:         &http.Client{Timeout: 10 * time.Second},
 		callbackSecret:     *callbackSecret,
@@ -400,6 +407,8 @@ func main() {
 		"interval", scanInterval.String(),
 		"default_callback", *callbackURL,
 		"rpc", *rpcURL,
+		"tron_qps", *tronQPS,
+		"tron_retry_429", *tronRetry429,
 		"listen", *listenAddr,
 		"scan_workers", app.scanWorkers,
 		"callback_batch", app.callbackBatch,

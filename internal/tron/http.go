@@ -17,6 +17,12 @@ func (c *Client) WithAPIKey(apiKey string) *Client {
 }
 
 func (c *Client) doRequest(ctx context.Context, method, requestURL string, body []byte, contentType string) ([]byte, int, error) {
+	if c.limiter != nil {
+		if err := c.limiter.Wait(ctx); err != nil {
+			return nil, 0, err
+		}
+	}
+
 	var reader io.Reader
 	if len(body) > 0 {
 		reader = bytes.NewReader(body)
@@ -33,17 +39,30 @@ func (c *Client) doRequest(ctx context.Context, method, requestURL string, body 
 		req.Header.Set("TRON-PRO-API-KEY", c.apiKey)
 	}
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer resp.Body.Close()
+	for attempt := 0; attempt <= c.retry429; attempt++ {
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, 0, err
+		}
+		responseBody, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, 0, readErr
+		}
 
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, 0, err
+		if resp.StatusCode != http.StatusTooManyRequests || attempt == c.retry429 {
+			return responseBody, resp.StatusCode, nil
+		}
+
+		delay := c.retryBase * time.Duration(1<<attempt)
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return nil, 0, ctx.Err()
+		}
 	}
-	return responseBody, resp.StatusCode, nil
+
+	return nil, 0, fmt.Errorf("unexpected retry loop exit")
 }
 
 func (c *Client) GetNowBlockNumber(ctx context.Context) (uint64, error) {

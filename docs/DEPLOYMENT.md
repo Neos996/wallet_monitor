@@ -12,6 +12,8 @@
   -scan-workers 4 \
   -rpc-url https://api.trongrid.io \
   -tron-api-key <TRON_PRO_API_KEY> \
+  -tron-qps 8 \
+  -tron-retry-429 3 \
   -callback-url https://business.example.com/wallet/callback \
   -callback-batch 100 \
   -callback-workers 4 \

@@ -104,6 +104,8 @@ TRON 生产收款场景一般不需要回填历史入账。
 - `-scan-workers`：每轮并发扫描地址数，默认 `4`（地址量大时可增加，但注意 RPC 限流）
 - `-rpc-url`：链上 RPC/网关 URL（TRON 可用 `https://api.trongrid.io` / `https://api.shasta.trongrid.io` / `https://nile.trongrid.io`）
 - `-tron-api-key`：TronGrid API key（建议生产必配，降低 429 风险）
+- `-tron-qps`：Tron API 全局 QPS 限制，默认 `8`（`0` 表示不限制）
+- `-tron-retry-429`：遇到 HTTP 429 时的指数退避重试次数，默认 `3`
 - `-callback-url`：默认回调地址（可被单地址 `callback_url` 覆盖）
 - `-callback-secret`：回调签名 HMAC secret（不为空则启用签名）
 - `-callback-retry-base`：回调失败重试基准间隔（指数退避基数），默认 `10s`

@@ -16,6 +16,9 @@ type Client struct {
 	apiURL     string
 	apiKey     string
 	httpClient *http.Client
+	limiter    *RateLimiter
+	retry429   int
+	retryBase  time.Duration
 }
 
 type IncomingTRXTransaction struct {
@@ -46,7 +49,24 @@ func NewClient(apiURL string) *Client {
 	return &Client{
 		apiURL:     strings.TrimRight(apiURL, "/"),
 		httpClient: defaultHTTPClient(),
+		retry429:   3,
+		retryBase:  500 * time.Millisecond,
 	}
+}
+
+func (c *Client) WithRateLimiter(limiter *RateLimiter) *Client {
+	c.limiter = limiter
+	return c
+}
+
+func (c *Client) WithRetry429(attempts int, base time.Duration) *Client {
+	if attempts > 0 {
+		c.retry429 = attempts
+	}
+	if base > 0 {
+		c.retryBase = base
+	}
+	return c
 }
 
 // GetIncomingTRXTransactions queries confirmed incoming TRX transfers since minBlockNumber (exclusive).
@@ -131,6 +151,7 @@ func (c *Client) GetIncomingTRXTransactions(ctx context.Context, address string,
 		}
 
 		reachedOldBlock := false
+		reachedLimit := len(resultPage.Data) >= pageSize
 
 		for _, item := range resultPage.Data {
 			if item.BlockNumber > latestObserved {
@@ -181,7 +202,7 @@ func (c *Client) GetIncomingTRXTransactions(ctx context.Context, address string,
 			})
 		}
 
-		if reachedOldBlock || resultPage.Meta.Fingerprint == "" {
+		if reachedOldBlock || !reachedLimit || resultPage.Meta.Fingerprint == "" {
 			break
 		}
 
@@ -277,6 +298,7 @@ func (c *Client) GetIncomingTRC20Transactions(ctx context.Context, address, cont
 		}
 
 		reachedOldBlock := false
+		reachedLimit := len(resultPage.Data) >= pageSize
 
 		for _, item := range resultPage.Data {
 			if item.Type != "Transfer" {
@@ -319,7 +341,7 @@ func (c *Client) GetIncomingTRC20Transactions(ctx context.Context, address, cont
 			time.Sleep(400 * time.Millisecond)
 		}
 
-		if reachedOldBlock || resultPage.Meta.Fingerprint == "" {
+		if reachedOldBlock || !reachedLimit || resultPage.Meta.Fingerprint == "" {
 			break
 		}
 
