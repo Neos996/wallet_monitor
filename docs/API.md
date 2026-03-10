@@ -188,6 +188,7 @@ Prometheus 指标（默认与管理接口同鉴权）。指标清单见 [OBSERVA
 说明：
 
 - `chain=evm` 的 `amount` 为原始整数（不带 decimals），需业务侧按 token decimals 换算。
+- `log_index`：仅 `chain=evm`，为 `eth_getLogs` 返回的 `logIndex`（同一 tx 内多笔 Transfer 的唯一标识）。
 
 ### 8.2 幂等与事件 ID
 

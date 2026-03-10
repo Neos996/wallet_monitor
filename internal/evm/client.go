@@ -105,6 +105,7 @@ type Log struct {
 	Topics          []string `json:"topics"`
 	Data            string   `json:"data"`
 	TransactionHash string   `json:"transactionHash"`
+	LogIndex        string   `json:"logIndex"`
 	BlockNumber     string   `json:"blockNumber"`
 }
 
@@ -112,6 +113,21 @@ func (c *Client) GetLogs(ctx context.Context, filter map[string]any) ([]Log, err
 	var result []Log
 	if err := c.call(ctx, "eth_getLogs", []any{filter}, &result); err != nil {
 		return nil, err
+	}
+	return result, nil
+}
+
+func (c *Client) EthCall(ctx context.Context, to string, data string) (string, error) {
+	var result string
+	params := []any{
+		map[string]any{
+			"to":   to,
+			"data": data,
+		},
+		"latest",
+	}
+	if err := c.call(ctx, "eth_call", params, &result); err != nil {
+		return "", err
 	}
 	return result, nil
 }

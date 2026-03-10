@@ -28,6 +28,7 @@ type CallbackTask struct {
 	AssetType     string     `gorm:"uniqueIndex:uniq_callback_task;size:32;not null" json:"asset_type"`
 	TokenContract string     `gorm:"uniqueIndex:uniq_callback_task;size:128" json:"token_contract"`
 	TxHash        string     `gorm:"uniqueIndex:uniq_callback_task;size:128;not null" json:"tx_hash"`
+	LogIndex      uint64     `gorm:"uniqueIndex:uniq_callback_task;not null;default:0" json:"log_index"`
 	BlockHeight   uint64     `json:"block_height"`
 	CallbackURL   string     `gorm:"size:256;not null" json:"callback_url"`
 	Status        string     `gorm:"index;size:16;not null;default:pending" json:"status"`
@@ -117,6 +118,7 @@ func (app *App) enqueueCallbackTask(ctx context.Context, addr WatchedAddress, ca
 		AssetType:     addr.AssetType,
 		TokenContract: addr.TokenContract,
 		TxHash:        tx.Hash,
+		LogIndex:      tx.LogIndex,
 		BlockHeight:   tx.BlockHeight,
 		CallbackURL:   callbackURL,
 		Status:        "pending",
@@ -136,7 +138,7 @@ func (app *App) enqueueCallbackTask(ctx context.Context, addr WatchedAddress, ca
 }
 
 func (app *App) buildCallbackPayload(addr WatchedAddress, tx Tx) CallbackPayload {
-	return CallbackPayload{
+	payload := CallbackPayload{
 		Chain:         addr.Chain,
 		Network:       addr.Network,
 		AssetType:     addr.AssetType,
@@ -150,6 +152,14 @@ func (app *App) buildCallbackPayload(addr WatchedAddress, tx Tx) CallbackPayload
 		Amount:        tx.Amount,
 		BlockHeight:   tx.BlockHeight,
 	}
+
+	// Only include log_index for EVM so existing TRON payloads stay byte-for-byte compatible.
+	if strings.ToLower(addr.Chain) == "evm" {
+		value := tx.LogIndex
+		payload.LogIndex = &value
+	}
+
+	return payload
 }
 
 func (app *App) processDueCallbackTasks(ctx context.Context, limit int) (CallbackTaskRunResult, error) {
@@ -271,6 +281,7 @@ func (app *App) deliverCallbackTask(ctx context.Context, task CallbackTask) erro
 		AssetType:     task.AssetType,
 		TokenContract: task.TokenContract,
 		TxHash:        task.TxHash,
+		LogIndex:      task.LogIndex,
 		BlockHeight:   task.BlockHeight,
 	}
 	if err := app.db.WithContext(ctx).Create(&row).Error; err != nil && !isUniqueConstraintError(err) {

@@ -9,6 +9,10 @@
 *.sqlite3
 data/
 
+# EVM local test (foundry)
+tools/evmtest/out/
+tools/evmtest/cache/
+
 # Logs
 *.log
 

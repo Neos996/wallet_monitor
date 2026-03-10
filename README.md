@@ -145,6 +145,7 @@ TRON 生产收款场景一般不需要回填历史入账。
 - `asset_type` / `token_contract` / `token_symbol` / `token_decimals`
 - `address`
 - `tx_hash`
+- `log_index`（仅 `chain=evm`：EVM 日志序号；用于同一 tx 内多笔 Transfer 的唯一标识）
 - `from` / `to`
 - `amount`
 - `block_height`
@@ -170,3 +171,4 @@ TRON 生产收款场景一般不需要回填历史入账。
 - SQLite 适合单机部署与 MVP；如果要做多实例/高可用，需要引入共享数据库与分布式锁（后续多链版本可一起演进）。
 
 更多部署细节见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
+

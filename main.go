@@ -48,6 +48,7 @@ type ProcessedTx struct {
 	AssetType     string    `gorm:"uniqueIndex:uniq_processed_delivery;size:32;not null" json:"asset_type"`
 	TokenContract string    `gorm:"uniqueIndex:uniq_processed_delivery;size:128" json:"token_contract"`
 	TxHash        string    `gorm:"uniqueIndex:uniq_processed_delivery;size:128;not null" json:"tx_hash"`
+	LogIndex      uint64    `gorm:"uniqueIndex:uniq_processed_delivery;not null;default:0" json:"log_index"`
 	BlockHeight   uint64    `json:"block_height"`
 	CreatedAt     time.Time `json:"created_at"`
 }
@@ -79,6 +80,7 @@ type ReceivedCallback struct {
 type Tx struct {
 	SourceID      uint64
 	Hash          string
+	LogIndex      uint64
 	From          string
 	To            string
 	Amount        string
@@ -90,18 +92,19 @@ type Tx struct {
 }
 
 type CallbackPayload struct {
-	Chain         string `json:"chain"`
-	Network       string `json:"network"`
-	AssetType     string `json:"asset_type"`
-	TokenContract string `json:"token_contract,omitempty"`
-	TokenSymbol   string `json:"token_symbol,omitempty"`
-	TokenDecimals int    `json:"token_decimals,omitempty"`
-	Address       string `json:"address"`
-	TxHash        string `json:"tx_hash"`
-	From          string `json:"from"`
-	To            string `json:"to"`
-	Amount        string `json:"amount"`
-	BlockHeight   uint64 `json:"block_height"`
+	Chain         string  `json:"chain"`
+	Network       string  `json:"network"`
+	AssetType     string  `json:"asset_type"`
+	TokenContract string  `json:"token_contract,omitempty"`
+	TokenSymbol   string  `json:"token_symbol,omitempty"`
+	TokenDecimals int     `json:"token_decimals,omitempty"`
+	Address       string  `json:"address"`
+	TxHash        string  `json:"tx_hash"`
+	LogIndex      *uint64 `json:"log_index,omitempty"`
+	From          string  `json:"from"`
+	To            string  `json:"to"`
+	Amount        string  `json:"amount"`
+	BlockHeight   uint64  `json:"block_height"`
 }
 
 type CreateAddressRequest struct {
@@ -356,9 +359,14 @@ func (c *MultiClient) scanEVMAddress(ctx context.Context, watched WatchedAddress
 			if err != nil {
 				continue
 			}
+			logIndex, err := parseHexUint64(logRow.LogIndex)
+			if err != nil {
+				continue
+			}
 			amount := parseHexBigInt(logRow.Data)
 			txs = append(txs, Tx{
 				Hash:          logRow.TransactionHash,
+				LogIndex:      logIndex,
 				From:          topicToAddress(logRow.Topics[1]),
 				To:            topicToAddress(logRow.Topics[2]),
 				Amount:        amount.String(),
@@ -366,6 +374,17 @@ func (c *MultiClient) scanEVMAddress(ctx context.Context, watched WatchedAddress
 				AssetType:     "erc20",
 				TokenContract: contract,
 			})
+		}
+	}
+
+	if len(txs) > 0 {
+		decimals, err := c.getERC20Decimals(ctx, watched.Chain, watched.Network, contract)
+		if err != nil {
+			slog.Warn("resolve erc20 decimals failed", "chain", watched.Chain, "network", watched.Network, "token_contract", contract, "err", err)
+		} else {
+			for i := range txs {
+				txs[i].TokenDecimals = decimals
+			}
 		}
 	}
 
@@ -428,7 +447,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := db.AutoMigrate(&WatchedAddress{}, &ProcessedTx{}, &MockIncomingTx{}, &ReceivedCallback{}, &CallbackTask{}); err != nil {
+	if err := db.AutoMigrate(&WatchedAddress{}, &TokenMetadata{}, &ProcessedTx{}, &MockIncomingTx{}, &ReceivedCallback{}, &CallbackTask{}); err != nil {
 		slog.Error("auto migrate failed", "err", err)
 		os.Exit(1)
 	}
@@ -673,6 +692,9 @@ func (app *App) scanOneAddress(ctx context.Context, addr WatchedAddress) address
 	if changed && len(txs) > 0 {
 		sort.Slice(txs, func(i, j int) bool {
 			if txs[i].BlockHeight == txs[j].BlockHeight {
+				if txs[i].Hash == txs[j].Hash {
+					return txs[i].LogIndex < txs[j].LogIndex
+				}
 				return txs[i].Hash < txs[j].Hash
 			}
 			return txs[i].BlockHeight < txs[j].BlockHeight
@@ -682,7 +704,7 @@ func (app *App) scanOneAddress(ctx context.Context, addr WatchedAddress) address
 		allHandled := true
 
 		for _, tx := range txs {
-			processed, err := app.isProcessed(ctx, addr, tx.Hash)
+			processed, err := app.isProcessed(ctx, addr, tx.Hash, tx.LogIndex)
 			if err != nil {
 				slog.Error("check processed tx failed", "tx_hash", tx.Hash, "err", err)
 				allHandled = false
@@ -747,12 +769,12 @@ func (app *App) scanOneAddress(ctx context.Context, addr WatchedAddress) address
 	return res
 }
 
-func (app *App) isProcessed(ctx context.Context, addr WatchedAddress, txHash string) (bool, error) {
+func (app *App) isProcessed(ctx context.Context, addr WatchedAddress, txHash string, logIndex uint64) (bool, error) {
 	var count int64
 	if err := app.db.WithContext(ctx).
 		Model(&ProcessedTx{}).
-		Where("chain = ? AND network = ? AND address = ? AND asset_type = ? AND token_contract = ? AND tx_hash = ?",
-			addr.Chain, addr.Network, addr.Address, addr.AssetType, addr.TokenContract, txHash).
+		Where("chain = ? AND network = ? AND address = ? AND asset_type = ? AND token_contract = ? AND tx_hash = ? AND log_index = ?",
+			addr.Chain, addr.Network, addr.Address, addr.AssetType, addr.TokenContract, txHash, logIndex).
 		Count(&count).Error; err != nil {
 		return false, err
 	}
@@ -1169,12 +1191,23 @@ func migrateLegacyIndexes(db *gorm.DB) error {
 	statements := []string{
 		"DROP INDEX IF EXISTS uniq_watched_address",
 		"DROP INDEX IF EXISTS uniq_processed_tx",
+		// Rebuild unique indexes to include new columns (e.g. log_index) across upgrades.
+		"DROP INDEX IF EXISTS uniq_processed_delivery",
+		"DROP INDEX IF EXISTS uniq_callback_task",
 	}
 
 	for _, statement := range statements {
 		if err := db.Exec(statement).Error; err != nil {
 			return err
 		}
+	}
+
+	// Recreate dropped indexes using the current schema definition.
+	if err := db.Migrator().CreateIndex(&ProcessedTx{}, "uniq_processed_delivery"); err != nil {
+		return err
+	}
+	if err := db.Migrator().CreateIndex(&CallbackTask{}, "uniq_callback_task"); err != nil {
+		return err
 	}
 
 	return nil
