@@ -1,0 +1,21 @@
+# Build artifacts
+/wallet_monitor
+*.exe
+*.out
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# Logs
+*.log
+
+# Local env/config
+.env
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/

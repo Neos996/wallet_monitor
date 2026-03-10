@@ -1,0 +1,28 @@
+services:
+  wallet_monitor:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+    command:
+      - "-listen"
+      - ":8080"
+      - "-db"
+      - "/data/wallets.db"
+      - "-scan-interval"
+      - "30s"
+      - "-scan-workers"
+      - "${SCAN_WORKERS:-4}"
+      - "-rpc-url"
+      - "https://api.trongrid.io"
+      - "-tron-api-key"
+      - "${TRON_API_KEY:-}"
+      - "-callback-url"
+      - "${CALLBACK_URL:-}"
+      - "-callback-batch"
+      - "${CALLBACK_BATCH:-100}"
+      - "-admin-token"
+      - "${ADMIN_TOKEN:-}"
+      - "-callback-secret"
+      - "${CALLBACK_SECRET:-}"
