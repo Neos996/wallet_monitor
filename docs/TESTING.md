@@ -283,6 +283,8 @@ env -u GOROOT -u GOPATH go run . \
   -db ./wallets_evm_test.db \
   -scan-interval 1m \
   -evm-rpc-url http://127.0.0.1:8545 \
+  -evm-scan-mode block \
+  -evm-topic-batch 100 \
   -callback-url http://127.0.0.1:8080/debug/callbacks
 ```
 

@@ -407,6 +407,8 @@ type App struct {
 	rpcURL             string
 	tronAPIKey         string
 	evmRPCURL          string
+	evmScanMode        string
+	evmTopicBatch      int
 	scanWorkers        int
 	callbackBatch      int
 	callbackWorkers    int
@@ -428,6 +430,8 @@ func main() {
 	tronRetry429 := flag.Int("tron-retry-429", 3, "number of retries for HTTP 429 from Tron API")
 	evmRPCURL := flag.String("evm-rpc-url", "", "EVM JSON-RPC endpoint for chain=evm")
 	evmLogRange := flag.Uint64("evm-log-range", 2000, "max block range per EVM log query")
+	evmScanMode := flag.String("evm-scan-mode", "address", "EVM scan mode: address (per watched address) or block (crawl logs by block height, batching watched to-address topics)")
+	evmTopicBatch := flag.Int("evm-topic-batch", 100, "max number of watched to-address topics per EVM log query when evm-scan-mode=block")
 	scanWorkers := flag.Int("scan-workers", 4, "number of concurrent address scans per tick")
 	callbackBatch := flag.Int("callback-batch", 100, "max callback tasks to process per scan loop")
 	callbackWorkers := flag.Int("callback-workers", 4, "number of concurrent callback deliveries")
@@ -480,6 +484,8 @@ func main() {
 		rpcURL:             strings.TrimSpace(*rpcURL),
 		tronAPIKey:         strings.TrimSpace(*tronAPIKey),
 		evmRPCURL:          strings.TrimSpace(*evmRPCURL),
+		evmScanMode:        strings.ToLower(strings.TrimSpace(*evmScanMode)),
+		evmTopicBatch:      *evmTopicBatch,
 		scanWorkers:        *scanWorkers,
 		callbackBatch:      *callbackBatch,
 		callbackWorkers:    *callbackWorkers,
@@ -541,6 +547,8 @@ func main() {
 		"tron_retry_429", *tronRetry429,
 		"evm_rpc", *evmRPCURL,
 		"evm_log_range", *evmLogRange,
+		"evm_scan_mode", strings.ToLower(strings.TrimSpace(*evmScanMode)),
+		"evm_topic_batch", *evmTopicBatch,
 		"listen", *listenAddr,
 		"scan_workers", app.scanWorkers,
 		"callback_batch", app.callbackBatch,
@@ -615,41 +623,66 @@ func (app *App) scanOnce(ctx context.Context) (ScanResult, error) {
 		return result, err
 	}
 
-	workers := app.scanWorkers
-	if workers <= 0 {
-		workers = 1
-	}
-	if workers > len(addresses) {
-		workers = len(addresses)
-	}
-	if workers == 0 {
-		workers = 1
-	}
-
-	addrCh := make(chan WatchedAddress)
-	resCh := make(chan addressResult, len(addresses))
-
-	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for addr := range addrCh {
-				resCh <- app.scanOneAddress(ctx, addr)
-			}
-		}()
-	}
-
-	go func() {
+	var evmAddresses []WatchedAddress
+	otherAddresses := addresses
+	if strings.ToLower(strings.TrimSpace(app.evmScanMode)) == "block" {
+		otherAddresses = make([]WatchedAddress, 0, len(addresses))
 		for _, addr := range addresses {
-			addrCh <- addr
+			if strings.ToLower(strings.TrimSpace(addr.Chain)) == "evm" && strings.ToLower(strings.TrimSpace(addr.AssetType)) == "erc20" {
+				evmAddresses = append(evmAddresses, addr)
+				continue
+			}
+			otherAddresses = append(otherAddresses, addr)
 		}
-		close(addrCh)
-		wg.Wait()
-		close(resCh)
-	}()
+	}
 
-	for res := range resCh {
+	if len(otherAddresses) > 0 {
+		workers := app.scanWorkers
+		if workers <= 0 {
+			workers = 1
+		}
+		if workers > len(otherAddresses) {
+			workers = len(otherAddresses)
+		}
+		if workers == 0 {
+			workers = 1
+		}
+
+		addrCh := make(chan WatchedAddress)
+		resCh := make(chan addressResult, len(otherAddresses))
+
+		var wg sync.WaitGroup
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for addr := range addrCh {
+					resCh <- app.scanOneAddress(ctx, addr)
+				}
+			}()
+		}
+
+		go func() {
+			for _, addr := range otherAddresses {
+				addrCh <- addr
+			}
+			close(addrCh)
+			wg.Wait()
+			close(resCh)
+		}()
+
+		for res := range resCh {
+			result.AddressesScanned += res.addressesScanned
+			result.DetectedTxs += res.detectedTxs
+			result.QueuedCallbacks += res.queuedCallbacks
+			result.DuplicateTxs += res.duplicateTxs
+			result.FailedCallbacks += res.failedCallbacks
+			result.UpdatedAddresses += res.updatedAddresses
+		}
+	}
+
+	if len(evmAddresses) > 0 {
+		res := app.scanEVMByBlockLogs(ctx, evmAddresses)
 		result.AddressesScanned += res.addressesScanned
 		result.DetectedTxs += res.detectedTxs
 		result.QueuedCallbacks += res.queuedCallbacks

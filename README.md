@@ -109,6 +109,8 @@ TRON 生产收款场景一般不需要回填历史入账。
 - `-tron-retry-429`：遇到 HTTP 429 时的指数退避重试次数，默认 `3`
 - `-evm-rpc-url`：EVM JSON-RPC 地址（`chain=evm` 必填）
 - `-evm-log-range`：EVM 单次日志查询最大区块范围，默认 `2000`
+- `-evm-scan-mode`：EVM 扫描模式：`address`（按地址逐个扫）或 `block`（按区块高度扫，批量合并 watched 地址的日志查询），默认 `address`
+- `-evm-topic-batch`：当 `-evm-scan-mode=block` 时，每次日志查询合并的 `to` 地址 topic 数量上限，默认 `100`
 - `-callback-url`：默认回调地址（可被单地址 `callback_url` 覆盖）
 - `-callback-secret`：回调签名 HMAC secret（不为空则启用签名）
 - `-callback-retry-base`：回调失败重试基准间隔（指数退避基数），默认 `10s`
@@ -171,4 +173,3 @@ TRON 生产收款场景一般不需要回填历史入账。
 - SQLite 适合单机部署与 MVP；如果要做多实例/高可用，需要引入共享数据库与分布式锁（后续多链版本可一起演进）。
 
 更多部署细节见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
-
