@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -23,26 +22,27 @@ type evmMatchedEvent struct {
 }
 
 func (app *App) scanEVMByBlockLogs(ctx context.Context, addrs []WatchedAddress) addressResult {
+	logger := loggerFromContext(ctx)
 	// Best-effort optimization; if anything looks off, fall back to the existing per-address scan path.
 	mc, ok := app.scanner.(*MultiClient)
 	if !ok {
-		slog.Warn("evm block scan requires MultiClient scanner; falling back to per-address scan")
+		logger.Warn("evm block scan requires MultiClient scanner; falling back to per-address scan")
 		return app.scanAddressesIndividually(ctx, addrs)
 	}
 	if strings.TrimSpace(mc.evmRPCURL) == "" {
-		slog.Warn("evm rpc url is empty; falling back to per-address scan")
+		logger.Warn("evm rpc url is empty; falling back to per-address scan")
 		return app.scanAddressesIndividually(ctx, addrs)
 	}
 
 	client := evmclient.NewClient(mc.evmRPCURL)
 	blockHex, err := client.GetBlockNumber(ctx)
 	if err != nil {
-		slog.Warn("get evm block number failed; falling back to per-address scan", "err", err)
+		logger.Warn("get evm block number failed; falling back to per-address scan", "err", err)
 		return app.scanAddressesIndividually(ctx, addrs)
 	}
 	currentBlock, err := parseHexUint64(blockHex)
 	if err != nil {
-		slog.Warn("parse evm block number failed; falling back to per-address scan", "value", blockHex, "err", err)
+		logger.Warn("parse evm block number failed; falling back to per-address scan", "value", blockHex, "err", err)
 		return app.scanAddressesIndividually(ctx, addrs)
 	}
 
@@ -56,7 +56,7 @@ func (app *App) scanEVMByBlockLogs(ctx context.Context, addrs []WatchedAddress) 
 		}
 		contract := strings.ToLower(strings.TrimSpace(addr.TokenContract))
 		if contract == "" {
-			slog.Warn("skip evm watcher: empty token_contract", "address_id", addr.ID, "address", addr.Address)
+			logger.Warn("skip evm watcher: empty token_contract", "address_id", addr.ID, "address", addr.Address)
 			continue
 		}
 		network := strings.ToLower(strings.TrimSpace(addr.Network))
@@ -86,16 +86,7 @@ func (app *App) scanEVMByBlockLogs(ctx context.Context, addrs []WatchedAddress) 
 		return tasks[i].network < tasks[j].network
 	})
 
-	workers := app.scanWorkers
-	if workers <= 0 {
-		workers = 1
-	}
-	if workers > len(tasks) {
-		workers = len(tasks)
-	}
-	if workers == 0 {
-		workers = 1
-	}
+	workers := normalizeWorkerCount(app.scanWorkers, len(tasks))
 
 	taskCh := make(chan evmLogCrawlKey)
 	resCh := make(chan addressResult, len(tasks))
@@ -122,12 +113,7 @@ func (app *App) scanEVMByBlockLogs(ctx context.Context, addrs []WatchedAddress) 
 
 	res := addressResult{}
 	for bucketRes := range resCh {
-		res.addressesScanned += bucketRes.addressesScanned
-		res.detectedTxs += bucketRes.detectedTxs
-		res.queuedCallbacks += bucketRes.queuedCallbacks
-		res.duplicateTxs += bucketRes.duplicateTxs
-		res.failedCallbacks += bucketRes.failedCallbacks
-		res.updatedAddresses += bucketRes.updatedAddresses
+		res.merge(bucketRes)
 	}
 
 	return res
@@ -136,13 +122,7 @@ func (app *App) scanEVMByBlockLogs(ctx context.Context, addrs []WatchedAddress) 
 func (app *App) scanAddressesIndividually(ctx context.Context, addrs []WatchedAddress) addressResult {
 	res := addressResult{}
 	for _, addr := range addrs {
-		r := app.scanOneAddress(ctx, addr)
-		res.addressesScanned += r.addressesScanned
-		res.detectedTxs += r.detectedTxs
-		res.queuedCallbacks += r.queuedCallbacks
-		res.duplicateTxs += r.duplicateTxs
-		res.failedCallbacks += r.failedCallbacks
-		res.updatedAddresses += r.updatedAddresses
+		res.merge(app.scanOneAddress(ctx, addr))
 	}
 	return res
 }
@@ -156,6 +136,7 @@ func (app *App) scanEVMLogBucket(
 	currentBlock uint64,
 ) addressResult {
 	res := addressResult{addressesScanned: len(addrs)}
+	logger := loggerFromContext(ctx)
 
 	if len(addrs) == 0 {
 		return res
@@ -217,7 +198,8 @@ func (app *App) scanEVMLogBucket(
 
 			logs, err := client.GetLogs(ctx, filter)
 			if err != nil {
-				slog.Error("evm getLogs failed", "network", key.network, "contract", key.contract, "err", err)
+				metrics.scanAddressFailuresTotal.Add(uint64(len(addrs)))
+				logger.Error("evm getLogs failed", "network", key.network, "contract", key.contract, "err", err)
 				return res
 			}
 
@@ -266,7 +248,7 @@ func (app *App) scanEVMLogBucket(
 	if len(events) > 0 {
 		value, err := mc.getERC20Decimals(ctx, "evm", key.network, key.contract)
 		if err != nil {
-			slog.Warn("resolve erc20 decimals failed", "network", key.network, "token_contract", key.contract, "err", err)
+			logger.Warn("resolve erc20 decimals failed", "network", key.network, "token_contract", key.contract, "err", err)
 		} else {
 			decimals = value
 		}
@@ -293,38 +275,14 @@ func (app *App) scanEVMLogBucket(
 		watched := events[i].addr
 		res.detectedTxs++
 
-		callbackURL := watched.CallbackURL
-		if callbackURL == "" {
-			callbackURL = app.defaultCallbackURL
-		}
-		if callbackURL == "" {
-			slog.Warn("skip tx: no callback URL configured", "tx_hash", tx.Hash, "log_index", tx.LogIndex, "address", watched.Address)
+		outcome, err := app.enqueueDetectedTx(ctx, watched, tx)
+		if err != nil {
 			res.failedCallbacks++
+			return res
+		}
+		res.applyQueueOutcome(outcome)
+		if outcome == detectedTxMissingCallback {
 			missingCallback[watched.ID] = true
-			continue
-		}
-
-		processed, err := app.isProcessed(ctx, watched, tx.Hash, tx.LogIndex)
-		if err != nil {
-			slog.Error("check processed tx failed", "tx_hash", tx.Hash, "log_index", tx.LogIndex, "err", err)
-			res.failedCallbacks++
-			return res
-		}
-		if processed {
-			res.duplicateTxs++
-			continue
-		}
-
-		created, err := app.enqueueCallbackTask(ctx, watched, callbackURL, tx)
-		if err != nil {
-			slog.Error("enqueue callback tx failed", "tx_hash", tx.Hash, "log_index", tx.LogIndex, "err", err)
-			res.failedCallbacks++
-			return res
-		}
-		if created {
-			res.queuedCallbacks++
-		} else {
-			res.duplicateTxs++
 		}
 	}
 
@@ -341,7 +299,7 @@ func (app *App) scanEVMLogBucket(
 			Model(&WatchedAddress{}).
 			Where("id IN ?", updateIDs).
 			Update("last_seen_height", cutoff).Error; err != nil {
-			slog.Error("update last_seen_height failed", "network", key.network, "contract", key.contract, "err", err)
+			logger.Error("update last_seen_height failed", "network", key.network, "contract", key.contract, "cutoff", cutoff, "err", err)
 			return res
 		}
 		res.updatedAddresses += len(updateIDs)

@@ -2,18 +2,13 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log/slog"
-	"math/big"
 	"net/http"
 	"os"
 	"os/signal"
-	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -380,7 +375,7 @@ func (c *MultiClient) scanEVMAddress(ctx context.Context, watched WatchedAddress
 	if len(txs) > 0 {
 		decimals, err := c.getERC20Decimals(ctx, watched.Chain, watched.Network, contract)
 		if err != nil {
-			slog.Warn("resolve erc20 decimals failed", "chain", watched.Chain, "network", watched.Network, "token_contract", contract, "err", err)
+			loggerFromContext(ctx).Warn("resolve erc20 decimals failed", "chain", watched.Chain, "network", watched.Network, "token_contract", contract, "err", err)
 		} else {
 			for i := range txs {
 				txs[i].TokenDecimals = decimals
@@ -396,25 +391,31 @@ func (c *MultiClient) resolveTronAPIURL(network string) string {
 }
 
 type App struct {
-	db                 *gorm.DB
-	scanner            BlockchainClient
-	defaultCallbackURL string
-	httpClient         *http.Client
-	callbackSecret     string
-	callbackRetryBase  time.Duration
-	maxCallbackRetries int
-	adminToken         string
-	rpcURL             string
-	tronAPIKey         string
-	evmRPCURL          string
-	evmScanMode        string
-	evmTopicBatch      int
-	scanWorkers        int
-	callbackBatch      int
-	callbackWorkers    int
-	callbackLimiter    *RateLimiter
-	retryOn4xx         bool
-	retryStatusCodes   map[int]bool
+	db                  *gorm.DB
+	scanner             BlockchainClient
+	defaultCallbackURL  string
+	callbackURLPolicies []callbackURLPolicy
+	httpClient          *http.Client
+	callbackSecret      string
+	callbackRetryBase   time.Duration
+	maxCallbackRetries  int
+	adminToken          string
+	rpcURL              string
+	tronAPIKey          string
+	evmRPCURL           string
+	evmScanMode         string
+	evmTopicBatch       int
+	scanWorkers         int
+	callbackBatch       int
+	callbackWorkers     int
+	callbackLimiter     *RateLimiter
+	retryOn4xx          bool
+	retryStatusCodes    map[int]bool
+	readyMaxScanAge     time.Duration
+	readyMaxDeadTasks   int
+	enableDebugRoutes   bool
+	scanMu              sync.Mutex
+	callbackDispatchMu  sync.Mutex
 }
 
 func main() {
@@ -440,6 +441,13 @@ func main() {
 	callbackRetryStatuses := flag.String("callback-retry-statuses", "", "comma-separated HTTP status codes to always retry (e.g. 409,425)")
 	scanInterval := flag.Duration("scan-interval", 15*time.Second, "scan interval")
 	listenAddr := flag.String("listen", ":8080", "HTTP listen address for admin API")
+	readyMaxScanAge := flag.Duration("ready-max-scan-age", 2*time.Minute, "maximum age of the last successful scan before /readyz fails; 0 disables")
+	readyMaxDeadTasks := flag.Int("ready-max-dead-tasks", -1, "maximum dead callback tasks before /readyz fails; -1 disables")
+	sqliteJournalMode := flag.String("sqlite-journal-mode", "WAL", "sqlite journal mode (e.g. WAL, DELETE)")
+	sqliteBusyTimeout := flag.Duration("sqlite-busy-timeout", 5*time.Second, "sqlite busy timeout")
+	sqliteMaxOpenConns := flag.Int("sqlite-max-open-conns", 1, "sqlite maximum open connections")
+	callbackURLAllowlist := flag.String("callback-url-allowlist", "", "comma-separated callback URL host allowlist; supports exact hosts and *.example.com wildcards")
+	enableDebugRoutes := flag.Bool("enable-debug-routes", true, "register debug endpoints (/mock/*, /debug/*); disable in production")
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -448,6 +456,10 @@ func main() {
 	db, err := gorm.Open(sqlite.Open(*dbPath), &gorm.Config{})
 	if err != nil {
 		slog.Error("open db failed", "err", err)
+		os.Exit(1)
+	}
+	if err := applySQLiteSettings(db, *sqliteJournalMode, *sqliteBusyTimeout, *sqliteMaxOpenConns); err != nil {
+		slog.Error("configure sqlite failed", "err", err)
 		os.Exit(1)
 	}
 
@@ -463,6 +475,16 @@ func main() {
 	callbackLimiter := NewRateLimiter(*callbackQPS)
 
 	retryStatusCodes := parseRetryStatusCodes(*callbackRetryStatuses)
+	callbackPolicies, err := parseCallbackURLAllowlist(*callbackURLAllowlist)
+	if err != nil {
+		slog.Error("parse callback URL allowlist failed", "err", err)
+		os.Exit(1)
+	}
+	defaultCallbackURLValue := strings.TrimSpace(*callbackURL)
+	if err := validateCallbackURL(defaultCallbackURLValue, callbackPolicies); err != nil {
+		slog.Error("validate default callback URL failed", "callback_url", defaultCallbackURLValue, "err", err)
+		os.Exit(1)
+	}
 
 	app := &App{
 		db: db,
@@ -475,23 +497,27 @@ func main() {
 			evmRPCURL:   *evmRPCURL,
 			evmLogRange: *evmLogRange,
 		},
-		defaultCallbackURL: *callbackURL,
-		httpClient:         &http.Client{Timeout: 10 * time.Second},
-		callbackSecret:     *callbackSecret,
-		callbackRetryBase:  *callbackRetryBase,
-		maxCallbackRetries: *maxCallbackRetries,
-		adminToken:         strings.TrimSpace(*adminToken),
-		rpcURL:             strings.TrimSpace(*rpcURL),
-		tronAPIKey:         strings.TrimSpace(*tronAPIKey),
-		evmRPCURL:          strings.TrimSpace(*evmRPCURL),
-		evmScanMode:        strings.ToLower(strings.TrimSpace(*evmScanMode)),
-		evmTopicBatch:      *evmTopicBatch,
-		scanWorkers:        *scanWorkers,
-		callbackBatch:      *callbackBatch,
-		callbackWorkers:    *callbackWorkers,
-		callbackLimiter:    callbackLimiter,
-		retryOn4xx:         *callbackRetryOn4xx,
-		retryStatusCodes:   retryStatusCodes,
+		defaultCallbackURL:  defaultCallbackURLValue,
+		callbackURLPolicies: callbackPolicies,
+		httpClient:          &http.Client{Timeout: 10 * time.Second},
+		callbackSecret:      *callbackSecret,
+		callbackRetryBase:   *callbackRetryBase,
+		maxCallbackRetries:  *maxCallbackRetries,
+		adminToken:          strings.TrimSpace(*adminToken),
+		rpcURL:              strings.TrimSpace(*rpcURL),
+		tronAPIKey:          strings.TrimSpace(*tronAPIKey),
+		evmRPCURL:           strings.TrimSpace(*evmRPCURL),
+		evmScanMode:         strings.ToLower(strings.TrimSpace(*evmScanMode)),
+		evmTopicBatch:       *evmTopicBatch,
+		scanWorkers:         *scanWorkers,
+		callbackBatch:       *callbackBatch,
+		callbackWorkers:     *callbackWorkers,
+		callbackLimiter:     callbackLimiter,
+		retryOn4xx:          *callbackRetryOn4xx,
+		retryStatusCodes:    retryStatusCodes,
+		readyMaxScanAge:     *readyMaxScanAge,
+		readyMaxDeadTasks:   *readyMaxDeadTasks,
+		enableDebugRoutes:   *enableDebugRoutes,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -508,25 +534,11 @@ func main() {
 	}()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
-	mux.HandleFunc("/addresses", app.requireAdmin(app.handleAddresses))
-	mux.HandleFunc("/addresses/", app.requireAdmin(app.handleAddressByID))
-	mux.HandleFunc("/scan/once", app.requireAdmin(app.handleScanOnce))
-	mux.HandleFunc("/callback-tasks", app.requireAdmin(app.handleCallbackTasks))
-	mux.HandleFunc("/callback-tasks/", app.requireAdmin(app.handleCallbackTaskByID))
-	mux.HandleFunc("/callback-tasks/retry", app.requireAdmin(app.handleRetryCallbackTasks))
-	mux.HandleFunc("/callback-tasks/dead/export", app.requireAdmin(app.handleExportDeadCallbackTasks))
-	mux.HandleFunc("/stats", app.requireAdmin(app.handleStats))
-	mux.HandleFunc("/mock/transactions", app.requireAdmin(app.handleMockTransactions))
-	mux.HandleFunc("/debug/callbacks", app.requireAdmin(app.handleDebugCallbacks))
-	mux.HandleFunc("/metrics", app.requireAdmin(app.handleMetrics))
+	app.registerRoutes(mux)
 
 	server := &http.Server{
 		Addr:    *listenAddr,
-		Handler: mux,
+		Handler: app.withObservability(mux),
 	}
 
 	go func() {
@@ -556,6 +568,13 @@ func main() {
 		"callback_qps", *callbackQPS,
 		"callback_retry_4xx", *callbackRetryOn4xx,
 		"callback_retry_statuses", *callbackRetryStatuses,
+		"ready_max_scan_age", readyMaxScanAge.String(),
+		"ready_max_dead_tasks", *readyMaxDeadTasks,
+		"sqlite_journal_mode", strings.ToUpper(strings.TrimSpace(*sqliteJournalMode)),
+		"sqlite_busy_timeout", sqliteBusyTimeout.String(),
+		"sqlite_max_open_conns", *sqliteMaxOpenConns,
+		"callback_url_allowlist", strings.TrimSpace(*callbackURLAllowlist),
+		"enable_debug_routes", *enableDebugRoutes,
 	)
 
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -564,802 +583,4 @@ func main() {
 	}
 
 	slog.Info("wallet monitor exited")
-}
-
-func runScanner(ctx context.Context, app *App, interval time.Duration) error {
-	if interval <= 0 {
-		interval = 15 * time.Second
-	}
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	// Run one scan immediately on startup so new deployments don't wait for the first tick.
-	{
-		result, err := app.scanOnce(ctx)
-		if err != nil {
-			return err
-		}
-		slog.Info("scan complete",
-			"addresses", result.AddressesScanned,
-			"txs", result.DetectedTxs,
-			"queued", result.QueuedCallbacks,
-			"callbacks", result.CallbacksSent,
-			"duplicates", result.DuplicateTxs,
-			"failed", result.FailedCallbacks,
-			"dead", result.DeadCallbacks,
-		)
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			result, err := app.scanOnce(ctx)
-			if err != nil {
-				slog.Error("scan error", "err", err)
-				continue
-			}
-			slog.Info("scan complete",
-				"addresses", result.AddressesScanned,
-				"txs", result.DetectedTxs,
-				"queued", result.QueuedCallbacks,
-				"callbacks", result.CallbacksSent,
-				"duplicates", result.DuplicateTxs,
-				"failed", result.FailedCallbacks,
-				"dead", result.DeadCallbacks,
-			)
-		}
-	}
-}
-
-func (app *App) scanOnce(ctx context.Context) (ScanResult, error) {
-	startedAt := time.Now()
-	result := ScanResult{ScannedAt: time.Now().UTC()}
-
-	var addresses []WatchedAddress
-	if err := app.db.WithContext(ctx).Where("enabled = ?", true).Find(&addresses).Error; err != nil {
-		return result, err
-	}
-
-	var evmAddresses []WatchedAddress
-	otherAddresses := addresses
-	if strings.ToLower(strings.TrimSpace(app.evmScanMode)) == "block" {
-		otherAddresses = make([]WatchedAddress, 0, len(addresses))
-		for _, addr := range addresses {
-			if strings.ToLower(strings.TrimSpace(addr.Chain)) == "evm" && strings.ToLower(strings.TrimSpace(addr.AssetType)) == "erc20" {
-				evmAddresses = append(evmAddresses, addr)
-				continue
-			}
-			otherAddresses = append(otherAddresses, addr)
-		}
-	}
-
-	if len(otherAddresses) > 0 {
-		workers := app.scanWorkers
-		if workers <= 0 {
-			workers = 1
-		}
-		if workers > len(otherAddresses) {
-			workers = len(otherAddresses)
-		}
-		if workers == 0 {
-			workers = 1
-		}
-
-		addrCh := make(chan WatchedAddress)
-		resCh := make(chan addressResult, len(otherAddresses))
-
-		var wg sync.WaitGroup
-		for i := 0; i < workers; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for addr := range addrCh {
-					resCh <- app.scanOneAddress(ctx, addr)
-				}
-			}()
-		}
-
-		go func() {
-			for _, addr := range otherAddresses {
-				addrCh <- addr
-			}
-			close(addrCh)
-			wg.Wait()
-			close(resCh)
-		}()
-
-		for res := range resCh {
-			result.AddressesScanned += res.addressesScanned
-			result.DetectedTxs += res.detectedTxs
-			result.QueuedCallbacks += res.queuedCallbacks
-			result.DuplicateTxs += res.duplicateTxs
-			result.FailedCallbacks += res.failedCallbacks
-			result.UpdatedAddresses += res.updatedAddresses
-		}
-	}
-
-	if len(evmAddresses) > 0 {
-		res := app.scanEVMByBlockLogs(ctx, evmAddresses)
-		result.AddressesScanned += res.addressesScanned
-		result.DetectedTxs += res.detectedTxs
-		result.QueuedCallbacks += res.queuedCallbacks
-		result.DuplicateTxs += res.duplicateTxs
-		result.FailedCallbacks += res.failedCallbacks
-		result.UpdatedAddresses += res.updatedAddresses
-	}
-
-	batch := app.callbackBatch
-	if batch <= 0 {
-		batch = 100
-	}
-	taskResult, err := app.processDueCallbackTasks(ctx, batch)
-	if err != nil {
-		return result, err
-	}
-	result.CallbacksSent += taskResult.CallbacksSent
-	result.FailedCallbacks += taskResult.FailedCallbacks
-	result.DeadCallbacks += taskResult.DeadCallbacks
-
-	recordScanMetrics(result, startedAt)
-	app.updateMetrics(ctx)
-
-	return result, nil
-}
-
-func (app *App) scanOneAddress(ctx context.Context, addr WatchedAddress) addressResult {
-	res := addressResult{addressesScanned: 1}
-
-	changed, newHeight, txs, err := app.scanner.ScanAddress(ctx, addr)
-	if err != nil {
-		slog.Error("scan address failed",
-			"chain", addr.Chain,
-			"network", addr.Network,
-			"address", addr.Address,
-			"err", err,
-		)
-		return res
-	}
-	if changed && len(txs) > 0 {
-		sort.Slice(txs, func(i, j int) bool {
-			if txs[i].BlockHeight == txs[j].BlockHeight {
-				if txs[i].Hash == txs[j].Hash {
-					return txs[i].LogIndex < txs[j].LogIndex
-				}
-				return txs[i].Hash < txs[j].Hash
-			}
-			return txs[i].BlockHeight < txs[j].BlockHeight
-		})
-
-		res.detectedTxs += len(txs)
-		allHandled := true
-
-		for _, tx := range txs {
-			processed, err := app.isProcessed(ctx, addr, tx.Hash, tx.LogIndex)
-			if err != nil {
-				slog.Error("check processed tx failed", "tx_hash", tx.Hash, "err", err)
-				allHandled = false
-				break
-			}
-
-			if processed {
-				res.duplicateTxs++
-				if err := app.markMockDelivered(ctx, addr.Chain, tx.SourceID); err != nil {
-					slog.Error("mark mock tx delivered failed", "err", err)
-				}
-				continue
-			}
-
-			callbackURL := addr.CallbackURL
-			if callbackURL == "" {
-				callbackURL = app.defaultCallbackURL
-			}
-			if callbackURL == "" {
-				slog.Warn("skip tx: no callback URL configured", "tx_hash", tx.Hash, "address", addr.Address)
-				res.failedCallbacks++
-				allHandled = false
-				break
-			}
-
-			created, err := app.enqueueCallbackTask(ctx, addr, callbackURL, tx)
-			if err != nil {
-				slog.Error("enqueue callback tx failed", "tx_hash", tx.Hash, "err", err)
-				res.failedCallbacks++
-				allHandled = false
-				break
-			}
-			if created {
-				res.queuedCallbacks++
-			} else {
-				res.duplicateTxs++
-			}
-
-			if err := app.markMockDelivered(ctx, addr.Chain, tx.SourceID); err != nil {
-				slog.Error("mark mock tx delivered failed", "err", err)
-				allHandled = false
-				break
-			}
-		}
-
-		if !allHandled {
-			return res
-		}
-	}
-
-	if newHeight > addr.LastSeenHeight {
-		if err := app.db.WithContext(ctx).
-			Model(&WatchedAddress{}).
-			Where("id = ?", addr.ID).
-			Update("last_seen_height", newHeight).Error; err != nil {
-			slog.Error("update last_seen_height failed", "address", addr.Address, "err", err)
-			return res
-		}
-		res.updatedAddresses++
-	}
-
-	return res
-}
-
-func (app *App) isProcessed(ctx context.Context, addr WatchedAddress, txHash string, logIndex uint64) (bool, error) {
-	var count int64
-	if err := app.db.WithContext(ctx).
-		Model(&ProcessedTx{}).
-		Where("chain = ? AND network = ? AND address = ? AND asset_type = ? AND token_contract = ? AND tx_hash = ? AND log_index = ?",
-			addr.Chain, addr.Network, addr.Address, addr.AssetType, addr.TokenContract, txHash, logIndex).
-		Count(&count).Error; err != nil {
-		return false, err
-	}
-
-	return count > 0, nil
-}
-
-func (app *App) markMockDelivered(ctx context.Context, chain string, sourceID uint64) error {
-	if chain != "mock" || sourceID == 0 {
-		return nil
-	}
-
-	return app.db.WithContext(ctx).
-		Model(&MockIncomingTx{}).
-		Where("id = ?", sourceID).
-		Update("delivered", true).Error
-}
-
-func (app *App) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if strings.TrimSpace(app.adminToken) == "" {
-			next(w, r)
-			return
-		}
-
-		token := strings.TrimSpace(r.Header.Get("X-Admin-Token"))
-		if token == "" {
-			auth := strings.TrimSpace(r.Header.Get("Authorization"))
-			if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
-				token = strings.TrimSpace(auth[len("bearer "):])
-			}
-		}
-
-		if token == "" || token != app.adminToken {
-			w.Header().Set("WWW-Authenticate", "Bearer")
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-
-		next(w, r)
-	}
-}
-
-func (app *App) handleAddresses(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		app.listAddresses(w, r)
-	case http.MethodPost:
-		app.createAddress(w, r)
-	default:
-		w.WriteHeader(http.StatusMethodNotAllowed)
-	}
-}
-
-func (app *App) listAddresses(w http.ResponseWriter, r *http.Request) {
-	query := app.db.WithContext(r.Context()).Order("id asc")
-	if value := strings.TrimSpace(r.URL.Query().Get("chain")); value != "" {
-		query = query.Where("chain = ?", strings.ToLower(value))
-	}
-	if value := strings.TrimSpace(r.URL.Query().Get("network")); value != "" {
-		query = query.Where("network = ?", strings.ToLower(value))
-	}
-	if value := strings.TrimSpace(r.URL.Query().Get("asset_type")); value != "" {
-		query = query.Where("asset_type = ?", strings.ToLower(value))
-	}
-	if value := strings.TrimSpace(r.URL.Query().Get("address")); value != "" {
-		query = query.Where("address = ?", value)
-	}
-	if value := strings.TrimSpace(r.URL.Query().Get("enabled")); value != "" {
-		switch strings.ToLower(value) {
-		case "true", "1":
-			query = query.Where("enabled = ?", true)
-		case "false", "0":
-			query = query.Where("enabled = ?", false)
-		}
-	}
-
-	var addrs []WatchedAddress
-	if err := query.Find(&addrs).Error; err != nil {
-		http.Error(w, "database error", http.StatusInternalServerError)
-		return
-	}
-
-	writeJSON(w, http.StatusOK, addrs)
-}
-
-func (app *App) createAddress(w http.ResponseWriter, r *http.Request) {
-	var req CreateAddressRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
-		return
-	}
-
-	if req.Address == "" {
-		http.Error(w, "address is required", http.StatusBadRequest)
-		return
-	}
-	if req.Chain == "" {
-		req.Chain = "tron"
-	}
-	if req.AssetType == "" {
-		if strings.ToLower(req.Chain) == "evm" {
-			req.AssetType = "erc20"
-		} else {
-			req.AssetType = "native"
-		}
-	}
-	if req.MinConfirmations <= 0 {
-		req.MinConfirmations = 1
-	}
-	req.Chain = strings.ToLower(req.Chain)
-	if req.Network == "" {
-		if req.Chain == "mock" {
-			req.Network = "local"
-		} else {
-			req.Network = "mainnet"
-		}
-	}
-	req.Network = strings.ToLower(req.Network)
-	req.AssetType = strings.ToLower(req.AssetType)
-	req.TokenContract = strings.TrimSpace(req.TokenContract)
-
-	switch req.Chain {
-	case "tron":
-		switch req.AssetType {
-		case "native", "trc20":
-		default:
-			http.Error(w, "unsupported tron asset_type", http.StatusBadRequest)
-			return
-		}
-		normalizedAddress, err := normalizeTronAddress(req.Address)
-		if err != nil {
-			http.Error(w, "invalid tron address", http.StatusBadRequest)
-			return
-		}
-		req.Address = normalizedAddress
-		if req.TokenContract != "" {
-			normalizedContract, err := normalizeTronAddress(req.TokenContract)
-			if err != nil {
-				http.Error(w, "invalid tron token_contract", http.StatusBadRequest)
-				return
-			}
-			req.TokenContract = normalizedContract
-		}
-		if req.AssetType == "trc20" && req.TokenContract == "" {
-			http.Error(w, "token_contract is required for tron trc20 watcher", http.StatusBadRequest)
-			return
-		}
-	case "evm":
-		if req.AssetType != "erc20" {
-			http.Error(w, "unsupported evm asset_type; supported: erc20", http.StatusBadRequest)
-			return
-		}
-		normalizedAddress, err := normalizeEVMAddress(req.Address)
-		if err != nil {
-			http.Error(w, "invalid evm address", http.StatusBadRequest)
-			return
-		}
-		req.Address = normalizedAddress
-		if req.TokenContract == "" {
-			http.Error(w, "token_contract is required for evm erc20 watcher", http.StatusBadRequest)
-			return
-		}
-		normalizedContract, err := normalizeEVMAddress(req.TokenContract)
-		if err != nil {
-			http.Error(w, "invalid evm token_contract", http.StatusBadRequest)
-			return
-		}
-		req.TokenContract = normalizedContract
-	case "mock":
-		switch req.AssetType {
-		case "native", "trc20", "erc20":
-		default:
-			http.Error(w, "unsupported mock asset_type", http.StatusBadRequest)
-			return
-		}
-	default:
-		http.Error(w, "unsupported chain", http.StatusBadRequest)
-		return
-	}
-
-	startHeight := uint64(0)
-	if req.StartHeight != nil {
-		startHeight = *req.StartHeight
-	} else if req.Chain == "tron" {
-		// Default behavior for production payment monitoring: start from current confirmed height,
-		// so a newly registered address won't backfill the entire historical tx list.
-		apiURL := resolveTronAPIURL(app.rpcURL, req.Network)
-		client := tronclient.NewClient(apiURL).WithAPIKey(app.tronAPIKey)
-		currentBlock, err := client.GetNowBlockNumber(r.Context())
-		if err != nil {
-			http.Error(w, "unable to resolve start_height from tron rpc (provide start_height explicitly or check rpc-url)", http.StatusBadGateway)
-			return
-		}
-		startHeight = calculateConfirmedCutoff(currentBlock, req.MinConfirmations)
-	} else if req.Chain == "evm" {
-		if app.evmRPCURL == "" {
-			http.Error(w, "evm rpc url not configured; provide -evm-rpc-url or start_height explicitly", http.StatusBadGateway)
-			return
-		}
-		client := evmclient.NewClient(app.evmRPCURL)
-		blockHex, err := client.GetBlockNumber(r.Context())
-		if err != nil {
-			http.Error(w, "unable to resolve start_height from evm rpc (provide start_height explicitly or check evm-rpc-url)", http.StatusBadGateway)
-			return
-		}
-		currentBlock, err := parseHexUint64(blockHex)
-		if err != nil {
-			http.Error(w, "invalid evm block number from rpc", http.StatusBadGateway)
-			return
-		}
-		startHeight = calculateConfirmedCutoff(currentBlock, req.MinConfirmations)
-	}
-
-	addr := WatchedAddress{
-		Chain:            req.Chain,
-		Network:          req.Network,
-		Address:          req.Address,
-		AssetType:        req.AssetType,
-		TokenContract:    req.TokenContract,
-		CallbackURL:      req.CallbackURL,
-		Enabled:          true,
-		MinConfirmations: req.MinConfirmations,
-		LastSeenHeight:   startHeight,
-	}
-
-	if err := app.db.WithContext(r.Context()).Create(&addr).Error; err != nil {
-		http.Error(w, "database error", http.StatusInternalServerError)
-		return
-	}
-
-	writeJSON(w, http.StatusCreated, addr)
-}
-
-func (app *App) handleScanOnce(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-
-	result, err := app.scanOnce(r.Context())
-	if err != nil {
-		http.Error(w, "scan failed", http.StatusInternalServerError)
-		return
-	}
-
-	writeJSON(w, http.StatusOK, result)
-}
-
-func (app *App) handleMockTransactions(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		app.listMockTransactions(w, r)
-	case http.MethodPost:
-		app.createMockTransaction(w, r)
-	case http.MethodDelete:
-		app.clearMockTransactions(w, r)
-	default:
-		w.WriteHeader(http.StatusMethodNotAllowed)
-	}
-}
-
-func (app *App) listMockTransactions(w http.ResponseWriter, r *http.Request) {
-	var rows []MockIncomingTx
-	if err := app.db.WithContext(r.Context()).Order("block_height asc, id asc").Find(&rows).Error; err != nil {
-		http.Error(w, "database error", http.StatusInternalServerError)
-		return
-	}
-
-	writeJSON(w, http.StatusOK, rows)
-}
-
-func (app *App) createMockTransaction(w http.ResponseWriter, r *http.Request) {
-	var req CreateMockTxRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
-		return
-	}
-
-	if req.Address == "" {
-		http.Error(w, "address is required", http.StatusBadRequest)
-		return
-	}
-	if req.Amount == "" {
-		http.Error(w, "amount is required", http.StatusBadRequest)
-		return
-	}
-	if req.Chain == "" {
-		req.Chain = "mock"
-	}
-	if req.Network == "" {
-		req.Network = "local"
-	}
-	req.Chain = strings.ToLower(req.Chain)
-	req.Network = strings.ToLower(req.Network)
-	if req.TxHash == "" {
-		req.TxHash = time.Now().UTC().Format("20060102150405.000000000")
-	}
-	if req.From == "" {
-		req.From = "mock_sender"
-	}
-	if req.To == "" {
-		req.To = req.Address
-	}
-	if req.BlockHeight == 0 {
-		var maxHeight uint64
-		if err := app.db.WithContext(r.Context()).
-			Model(&MockIncomingTx{}).
-			Select("COALESCE(MAX(block_height), 0)").
-			Scan(&maxHeight).Error; err != nil {
-			http.Error(w, "database error", http.StatusInternalServerError)
-			return
-		}
-		req.BlockHeight = maxHeight + 1
-	}
-
-	row := MockIncomingTx{
-		Chain:       req.Chain,
-		Network:     req.Network,
-		Address:     req.Address,
-		TxHash:      req.TxHash,
-		From:        req.From,
-		To:          req.To,
-		Amount:      req.Amount,
-		BlockHeight: req.BlockHeight,
-	}
-
-	if err := app.db.WithContext(r.Context()).Create(&row).Error; err != nil {
-		http.Error(w, "database error", http.StatusInternalServerError)
-		return
-	}
-
-	writeJSON(w, http.StatusCreated, row)
-}
-
-func (app *App) clearMockTransactions(w http.ResponseWriter, r *http.Request) {
-	if err := app.db.WithContext(r.Context()).Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&MockIncomingTx{}).Error; err != nil {
-		http.Error(w, "database error", http.StatusInternalServerError)
-		return
-	}
-
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (app *App) handleDebugCallbacks(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		app.listReceivedCallbacks(w, r)
-	case http.MethodPost:
-		app.receiveDebugCallback(w, r)
-	case http.MethodDelete:
-		app.clearReceivedCallbacks(w, r)
-	default:
-		w.WriteHeader(http.StatusMethodNotAllowed)
-	}
-}
-
-func (app *App) listReceivedCallbacks(w http.ResponseWriter, r *http.Request) {
-	var rows []ReceivedCallback
-	if err := app.db.WithContext(r.Context()).Order("id asc").Find(&rows).Error; err != nil {
-		http.Error(w, "database error", http.StatusInternalServerError)
-		return
-	}
-
-	writeJSON(w, http.StatusOK, rows)
-}
-
-func (app *App) receiveDebugCallback(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "read body failed", http.StatusBadRequest)
-		return
-	}
-
-	var payload CallbackPayload
-	if err := json.Unmarshal(body, &payload); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
-		return
-	}
-
-	row := ReceivedCallback{
-		Address:     payload.Address,
-		TxHash:      payload.TxHash,
-		BlockHeight: payload.BlockHeight,
-		Payload:     string(body),
-	}
-
-	if err := app.db.WithContext(r.Context()).Create(&row).Error; err != nil {
-		http.Error(w, "database error", http.StatusInternalServerError)
-		return
-	}
-
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (app *App) clearReceivedCallbacks(w http.ResponseWriter, r *http.Request) {
-	if err := app.db.WithContext(r.Context()).Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&ReceivedCallback{}).Error; err != nil {
-		http.Error(w, "database error", http.StatusInternalServerError)
-		return
-	}
-
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func writeJSON(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(value); err != nil {
-		http.Error(w, "encode error", http.StatusInternalServerError)
-	}
-}
-
-func migrateLegacyIndexes(db *gorm.DB) error {
-	statements := []string{
-		"DROP INDEX IF EXISTS uniq_watched_address",
-		"DROP INDEX IF EXISTS uniq_processed_tx",
-		// Rebuild unique indexes to include new columns (e.g. log_index) across upgrades.
-		"DROP INDEX IF EXISTS uniq_processed_delivery",
-		"DROP INDEX IF EXISTS uniq_callback_task",
-	}
-
-	for _, statement := range statements {
-		if err := db.Exec(statement).Error; err != nil {
-			return err
-		}
-	}
-
-	// Recreate dropped indexes using the current schema definition.
-	if err := db.Migrator().CreateIndex(&ProcessedTx{}, "uniq_processed_delivery"); err != nil {
-		return err
-	}
-	if err := db.Migrator().CreateIndex(&CallbackTask{}, "uniq_callback_task"); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func resolveTronAPIURL(rpcURL, network string) string {
-	if strings.TrimSpace(rpcURL) != "" {
-		return strings.TrimSpace(rpcURL)
-	}
-
-	switch strings.ToLower(strings.TrimSpace(network)) {
-	case "shasta":
-		return "https://api.shasta.trongrid.io"
-	case "nile":
-		return "https://nile.trongrid.io"
-	default:
-		return "https://api.trongrid.io"
-	}
-}
-
-func normalizeTronAddress(address string) (string, error) {
-	address = strings.TrimSpace(address)
-	if address == "" {
-		return "", errors.New("empty tron address")
-	}
-
-	hexAddress, err := tronclient.AddressToHex(address)
-	if err != nil {
-		return "", err
-	}
-
-	return tronclient.HexToAddress(hexAddress)
-}
-
-func normalizeEVMAddress(address string) (string, error) {
-	value := strings.ToLower(strings.TrimSpace(address))
-	if value == "" {
-		return "", errors.New("empty evm address")
-	}
-	if !strings.HasPrefix(value, "0x") {
-		value = "0x" + value
-	}
-	if len(value) != 42 {
-		return "", errors.New("invalid evm address length")
-	}
-	if !isHexString(value[2:]) {
-		return "", errors.New("invalid evm address hex")
-	}
-	return value, nil
-}
-
-func padTopicAddress(address string) string {
-	value := strings.ToLower(strings.TrimSpace(address))
-	value = strings.TrimPrefix(value, "0x")
-	if len(value) > 40 {
-		value = value[len(value)-40:]
-	}
-	return "0x" + strings.Repeat("0", 64-len(value)) + value
-}
-
-func topicToAddress(topic string) string {
-	value := strings.ToLower(strings.TrimSpace(topic))
-	value = strings.TrimPrefix(value, "0x")
-	if len(value) > 40 {
-		value = value[len(value)-40:]
-	}
-	return "0x" + value
-}
-
-func parseHexUint64(value string) (uint64, error) {
-	value = strings.TrimSpace(value)
-	value = strings.TrimPrefix(value, "0x")
-	if value == "" {
-		return 0, nil
-	}
-	return strconv.ParseUint(value, 16, 64)
-}
-
-func parseHexBigInt(value string) *big.Int {
-	text := strings.TrimSpace(value)
-	text = strings.TrimPrefix(text, "0x")
-	if text == "" {
-		return big.NewInt(0)
-	}
-	result := new(big.Int)
-	if _, ok := result.SetString(text, 16); !ok {
-		return big.NewInt(0)
-	}
-	return result
-}
-
-func isHexString(input string) bool {
-	if input == "" {
-		return false
-	}
-	for _, r := range input {
-		switch {
-		case r >= '0' && r <= '9':
-		case r >= 'a' && r <= 'f':
-		case r >= 'A' && r <= 'F':
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-func parseRetryStatusCodes(input string) map[int]bool {
-	result := map[int]bool{}
-	for _, raw := range strings.Split(input, ",") {
-		value := strings.TrimSpace(raw)
-		if value == "" {
-			continue
-		}
-		code, err := strconv.Atoi(value)
-		if err != nil || code <= 0 {
-			continue
-		}
-		result[code] = true
-	}
-	return result
 }
