@@ -1,29 +1,106 @@
-# 接口与回调协议说明
+# 接口与回调协议
 
-本文档面向业务接入方与运维人员，描述 `wallet_monitor` 的管理 API 与回调协议。
+本文档面向接入方、后端开发和运维人员，说明 `wallet_monitor` 的管理接口、回调协议和当前已落地的排障约束。
 
-## 1. 鉴权（管理接口）
+## 1. 鉴权与请求跟踪
 
-除 `/healthz` 外，所有管理接口均可通过 `-admin-token` 启用鉴权。
+### 1.1 管理接口鉴权
 
-启用后需要携带以下之一：
+除 `GET /healthz` 与 `GET /readyz` 外，管理接口可通过 `-admin-token` 开启鉴权。
+
+启用后，请求必须携带以下任一请求头：
 
 - `Authorization: Bearer <ADMIN_TOKEN>`
 - `X-Admin-Token: <ADMIN_TOKEN>`
 
-未携带或错误会返回 `401 Unauthorized`。
+未携带或 token 错误时返回：
 
-## 2. 健康检查
+- `401 Unauthorized`
 
-`GET /healthz`
+### 1.2 请求跟踪头
 
-返回 `200 ok`（文本）。
+服务会为每个 HTTP 请求生成并返回：
 
-## 3. 地址管理
+- `X-Request-ID`
 
-### 3.1 查询地址
+如果调用方已经传入 `X-Request-ID`，服务会原样透传，便于和上游网关、业务系统串联日志。
 
-`GET /addresses`
+### 1.3 分页响应头
+
+列表接口支持可选分页。分页场景下会返回：
+
+- `X-Total-Count`
+- `X-Limit`
+- `X-Offset`
+
+## 2. 通用说明
+
+### 2.1 基础地址
+
+默认监听地址由 `-listen` 指定，例如：
+
+- `http://127.0.0.1:8080`
+
+### 2.2 内容类型
+
+除下载类接口外，请求与响应默认使用：
+
+- `Content-Type: application/json`
+
+### 2.3 主要资源
+
+系统主要管理以下资源：
+
+- `WatchedAddress`：监控地址
+- `CallbackTask`：回调任务
+- `ProcessedTx`：成功处理过的交易事件
+
+## 3. 健康检查
+
+### 3.1 `GET /healthz`
+
+- 不需要鉴权
+- 返回纯文本 `ok`
+- 用于 liveness probe
+
+### 3.2 `GET /readyz`
+
+- 不需要鉴权
+- 返回 JSON
+- 用于 readiness probe
+
+当前检查项：
+
+- 数据库连通性
+- 最近一次成功扫描是否超过 `-ready-max-scan-age`
+- 死信任务数是否超过 `-ready-max-dead-tasks`
+
+失败时返回：
+
+- `503 Service Unavailable`
+
+响应示例：
+
+```json
+{
+  "status": "ok",
+  "request_id": "req_7b3f8f7a9b71",
+  "last_successful_scan_unix": 1710000000,
+  "last_successful_scan_age_seconds": 4.2,
+  "dead_callback_tasks": 0,
+  "checks": [
+    {"name": "database", "status": "ok"},
+    {"name": "scan_freshness", "status": "ok", "detail": "last successful scan age 4s"},
+    {"name": "dead_callbacks", "status": "skipped", "detail": "disabled (current=0)"}
+  ]
+}
+```
+
+## 4. 地址管理接口
+
+### 4.1 查询地址列表
+
+- `GET /addresses`
 
 可选查询参数：
 
@@ -31,15 +108,25 @@
 - `network`
 - `asset_type`
 - `address`
-- `enabled`（`true|false` 或 `1|0`）
+- `enabled=true|false|1|0`
+- `limit`
+- `offset`
 
-响应为 `WatchedAddress` 数组。
+响应：
 
-### 3.2 新增地址
+- `200 OK`
+- 返回 `WatchedAddress[]`
 
-`POST /addresses`
+说明：
 
-请求体（JSON）：
+- 不传 `limit` / `offset` 时保持兼容，返回全部结果
+- 建议生产排障时显式带分页参数
+
+### 4.2 新增监控地址
+
+- `POST /addresses`
+
+请求示例：
 
 ```json
 {
@@ -54,27 +141,40 @@
 }
 ```
 
-说明：
+字段说明：
 
-- `chain` 默认 `tron`；`network` 默认 `mainnet`（`mock` 则默认 `local`）。
-- `asset_type` 支持 `native` / `trc20` / `erc20`（`chain=evm` 时仅支持 `erc20`）。
-- `token_contract` 在 `trc20` / `erc20` 时必填。
-- `min_confirmations` 用于确认数判断（只回调达到确认数的交易）。
-- `start_height` 可选：控制 `last_seen_height` 初始值。  
-  `chain=tron` 且不传时，会自动设置为“当前已确认高度”（基于 `min_confirmations` 的 confirmed cutoff），避免历史回填。
-  `chain=evm` 同理（需配置 `-evm-rpc-url`）。
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `chain` | 否 | 默认 `tron` |
+| `network` | 否 | 默认 `mainnet`；`mock` 默认 `local` |
+| `address` | 是 | 待监控地址 |
+| `asset_type` | 否 | `native` / `trc20` / `erc20` |
+| `token_contract` | 条件必填 | `trc20` / `erc20` 时必填 |
+| `callback_url` | 否 | 单地址回调地址；不传则使用全局 `-callback-url` |
+| `min_confirmations` | 否 | 最小确认数 |
+| `start_height` | 否 | 初始扫描高度 |
 
-响应：`201 Created`，返回创建后的 `WatchedAddress`。
+规则说明：
 
-### 3.3 查询单个地址
+- `chain=evm` 时仅支持 `asset_type=erc20`
+- `chain=tron` 且未传 `start_height` 时，系统会把 `last_seen_height` 初始化为当前已确认高度，默认不回填历史
+- `chain=evm` 同理，但要求已配置 `-evm-rpc-url`
+- 如果配置了 `-callback-url-allowlist`，则 `callback_url` 的 host 必须命中白名单
 
-`GET /addresses/{id}`
+响应：
 
-### 3.4 更新地址
+- `201 Created`
+- 返回创建后的 `WatchedAddress`
 
-`PATCH /addresses/{id}`
+### 4.3 查询单个地址
 
-请求体（JSON，可选字段）：
+- `GET /addresses/{id}`
+
+### 4.4 更新地址
+
+- `PATCH /addresses/{id}`
+
+请求示例：
 
 ```json
 {
@@ -85,88 +185,173 @@
 }
 ```
 
+可更新字段：
+
+- `callback_url`
+- `enabled`
+- `min_confirmations`
+- `last_seen_height`
+
 说明：
 
-- `last_seen_height` 常用于回补或回滚扫描高度。
+- 如果更新了 `callback_url`，同样会校验 `-callback-url-allowlist`
 
-### 3.5 删除地址
+### 4.5 删除地址
 
-`DELETE /addresses/{id}`
+- `DELETE /addresses/{id}`
 
-### 3.6 启停地址
+说明：
+
+- 删除后，该地址不再参与后续扫描
+- 当前实现会删除该地址下 `pending` / `retrying` / `dead` 的回调任务
+
+### 4.6 启用 / 禁用地址
 
 - `POST /addresses/{id}/enable`
 - `POST /addresses/{id}/disable`
 
-## 4. 扫描触发
+## 5. 扫描触发接口
 
-`POST /scan/once`
+### 5.1 手动触发一轮扫描
 
-返回 `ScanResult`，包含扫描统计与回调处理结果。
+- `POST /scan/once`
 
-## 5. 回调任务队列（CallbackTask）
+成功响应：
 
-### 5.1 查询任务
+- `200 OK`
+- Header 返回 `X-Scan-ID`
+- Body 返回 `ScanResult`
 
-`GET /callback-tasks`
+冲突响应：
+
+- `409 Conflict`
+
+冲突含义：
+
+- 当前已有扫描执行中，服务会拒绝新的同进程扫描
+
+示例字段：
+
+- `addresses_scanned`
+- `detected_txs`
+- `queued_callbacks`
+- `callbacks_sent`
+- `duplicate_txs`
+- `failed_callbacks`
+- `dead_callbacks`
+- `updated_addresses`
+- `scanned_at`
+
+## 6. 回调任务接口
+
+### 6.1 查询任务列表
+
+- `GET /callback-tasks`
 
 可选查询参数：
 
-- `status`：`pending|retrying|success|dead`
+- `status=pending|retrying|success|dead`
 - `chain`
 - `address`
+- `limit`
+- `offset`
 
-### 5.2 查询单条任务
+### 6.2 查询单个任务
 
-`GET /callback-tasks/{id}`
+- `GET /callback-tasks/{id}`
 
-### 5.3 手动重试
+### 6.3 手动重试
 
-- `POST /callback-tasks/{id}/retry`：重试单条
-- `POST /callback-tasks/retry`：批量重试（`retrying` / `dead` -> `retrying`）
+- `POST /callback-tasks/{id}/retry`：重试单个任务
+- `POST /callback-tasks/retry`：批量重试任务
 
-### 5.4 死信导出
+批量重试说明：
 
-`GET /callback-tasks/dead/export`
+- 会把 `retrying` / `dead` 状态任务重新置为可重试状态
+- 若当前已有回调分发执行中，返回 `409 Conflict`
+
+### 6.4 导出死信任务
+
+- `GET /callback-tasks/dead/export`
 
 可选参数：
 
-- `format=csv`：导出 CSV
+- `format=csv`
 
-默认返回 JSON 数组。
+默认返回：
 
-## 6. 统计信息
+- JSON 数组
 
-`GET /stats`
+用途：
 
-返回：
+- 排障
+- 审核
+- 死信恢复
 
-- `watched_total` / `watched_enabled` / `watched_disabled`
+## 7. 统计与指标接口
+
+### 7.1 统计信息
+
+- `GET /stats`
+
+返回字段包括：
+
+- `watched_total`
+- `watched_enabled`
+- `watched_disabled`
 - `processed_tx_total`
-- `callback_pending` / `callback_retrying` / `callback_success` / `callback_dead`
+- `callback_pending`
+- `callback_retrying`
+- `callback_success`
+- `callback_dead`
 - `debug_callbacks`
 
-## 7. 指标
+### 7.2 Prometheus 指标
 
-`GET /metrics`
+- `GET /metrics`
 
-Prometheus 指标（默认与管理接口同鉴权）。指标清单见 [OBSERVABILITY.md](OBSERVABILITY.md)。
+说明：
 
-## 8. 本地联调接口（建议生产隔离）
+- 默认与管理接口共用鉴权
+- 详细指标见 `docs/OBSERVABILITY.md`
+
+## 8. 本地联调接口
+
+以下接口用于本地验证，生产环境应通过 token 与网络隔离保护：
 
 - `GET/POST/DELETE /mock/transactions`
 - `GET/POST/DELETE /debug/callbacks`
 
-## 9. 回调协议（业务侧）
+生产建议：
 
-### 8.1 回调请求
+- 配置 `-enable-debug-routes=false` 直接禁用这些调试接口
 
-- Method: `POST`
-- URL: `callback_url`
-- Header: `Content-Type: application/json`
-- Body: `CallbackPayload`
+两个列表接口同样支持可选分页参数：
 
-示例：
+- `limit`
+- `offset`
+
+## 9. 回调协议
+
+### 9.1 请求方式
+
+服务向业务方发起：
+
+- `POST <callback_url>`
+
+### 9.2 Header
+
+固定携带：
+
+- `Content-Type: application/json`
+- `X-WalletMonitor-Event-ID: <task_id>`
+
+启用 `-callback-secret` 时额外携带：
+
+- `X-WalletMonitor-Timestamp`
+- `X-WalletMonitor-Signature`
+
+### 9.3 Body 示例
 
 ```json
 {
@@ -187,61 +372,30 @@ Prometheus 指标（默认与管理接口同鉴权）。指标清单见 [OBSERVA
 
 说明：
 
-- `chain=evm` 的 `amount` 为原始整数（不带 decimals），需业务侧按 token decimals 换算。
-- `log_index`：仅 `chain=evm`，为 `eth_getLogs` 返回的 `logIndex`（同一 tx 内多笔 Transfer 的唯一标识）。
+- EVM 场景会额外携带 `log_index`
+- 同一笔 EVM 交易内多条 `Transfer` 会拆成多次独立回调
 
-### 8.2 幂等与事件 ID
+### 9.4 业务方要求
 
-每次回调都会带：
+业务方必须：
 
-```
-X-WalletMonitor-Event-ID: <callback_task_id>
-```
+- 返回 `2xx` 表示成功
+- 按 `X-WalletMonitor-Event-ID` 做幂等
+- 启用签名时验证 `X-WalletMonitor-Signature`
 
-业务侧建议以该 ID 做幂等键（同一事件重试时 ID 不变）。
+### 9.5 失败处理
 
-### 8.3 签名（可选）
+- 非 `2xx`、超时、网络错误会进入重试
+- 达到最大重试次数后任务进入 `dead`
+- 当前实现会记录失败类型、HTTP 状态码和响应体摘要，便于排障
 
-启动参数 `-callback-secret` 不为空时，会额外带签名头：
+## 10. 常见状态码
 
-- `X-WalletMonitor-Timestamp: <unix_seconds>`
-- `X-WalletMonitor-Signature: <hex(hmac_sha256(secret, timestamp + "." + payload_json))>`
-
-注意：
-
-- `payload_json` 为 **原始 HTTP body 字节串**（不要二次序列化/重排字段）。
-- 业务侧验签失败应返回非 2xx，使其进入重试队列。
-
-验签示例（shell）：
-
-```bash
-timestamp="1700000000"
-payload='{"a":1}'
-secret="s3cr3t"
-
-printf "%s.%s" "$timestamp" "$payload" \
-  | openssl dgst -sha256 -hmac "$secret" -hex \
-  | awk '{print $2}'
-```
-
-### 8.5 回调失败分类与重试策略
-
-回调失败会记录到 `CallbackTask` 的以下字段：
-
-- `last_error_type`：`timeout` / `transport` / `context` / `non_2xx` / `request` / `unknown`
-- `last_status_code`：HTTP 状态码（仅当 `non_2xx`）
-- `last_error`：原始错误信息
-
-默认重试策略：
-
-- `timeout` / `transport` / `context`：重试
-- `non_2xx`：仅对 `5xx`、`408`、`429` 重试
-
-可通过参数调整：
-
-- `-callback-retry-4xx`：对所有 `4xx` 进行重试
-- `-callback-retry-statuses`：逗号分隔的额外状态码列表（例如 `409,425`）
-
-### 8.4 成功响应
-
-业务侧返回任意 `2xx` 表示成功；非 2xx 或超时会进入重试队列，超过最大重试次数进入 `dead`。
+| 场景 | 状态码 | 说明 |
+|---|---|---|
+| 管理接口未鉴权 | `401` | 缺少 token 或 token 错误 |
+| 参数错误 | `400` | JSON、ID、分页参数非法 |
+| 资源不存在 | `404` | 地址或任务不存在 |
+| 扫描 / 回调分发冲突 | `409` | 同进程已有对应执行流在运行 |
+| 下游或数据库异常 | `500` | 服务内部错误 |
+| 就绪检查失败 | `503` | 数据库、扫描新鲜度或死信阈值不满足 |

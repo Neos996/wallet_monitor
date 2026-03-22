@@ -1,16 +1,55 @@
-# 业务链调用流程图
+# 业务调用流程
 
-## 1. 文件说明
+本文档说明业务系统接入 `wallet_monitor` 后的调用链路，以及监控服务内部如何完成扫链、入队、回调和去重。
 
-本文件用于说明支付业务系统接入 `wallet_monitor` 后的整体调用链路。
+配套文件：
+- Mermaid 源文件：`business_call_flow.mmd`
+- SVG 图：`business_call_flow.svg`
 
-配套 SVG：
+## 1. 一句话说明
 
-- `wallet_monitor/docs/business_call_flow.svg`
+**业务系统只负责注册地址和接收回调；`wallet_monitor` 负责扫链、确认数判断、幂等去重、回调重试和死信管理。**
 
-直接打开 SVG 即可查看完整流程图。
+## 2. 主流程
 
-## 2. Mermaid 时序图
+### 2.1 注册监控地址
+业务系统创建收款订单或生成收款地址后，调用：
+
+- `POST /addresses`
+
+监控服务会把监控目标写入 `WatchedAddress`，并初始化扫描进度：
+- TRON / EVM 在未传 `start_height` 时，会把 `last_seen_height` 初始化为“当前已确认高度”，默认不回填历史
+- 如需回填，必须显式传 `start_height`
+
+### 2.2 定时扫描或手动触发
+扫描由两种方式触发：
+- 定时任务
+- `POST /scan/once`
+
+每轮扫描会读取所有 `enabled=true` 的地址，并按 `chain / asset_type` 选择适配器：
+- `mock`
+- `tron + native`
+- `tron + trc20`
+- `evm + erc20`
+
+### 2.3 扫描命中新入账
+当适配器发现新入账时，服务会执行以下动作：
+1. 标准化为统一的 `Tx` 结构
+2. 检查是否已成功处理过（`ProcessedTx`）
+3. 若未处理，则尝试写入 `CallbackTask`
+4. 在无致命错误的前提下推进 `last_seen_height`
+
+### 2.4 回调投递
+扫描阶段不会直接把“成功与否”作为唯一结果，而是先把回调任务持久化，再由任务执行器投递。
+
+任务执行器会：
+1. 读取到期的 `pending/retrying` 任务
+2. 向 `callback_url` 发送 HTTP POST
+3. 成功时将任务标记为 `success`，并写入 `ProcessedTx`
+4. 失败时写入错误信息，并按指数退避安排重试
+5. 超过最大重试次数后标记为 `dead`
+
+## 3. 时序图
 
 ```mermaid
 sequenceDiagram
@@ -20,162 +59,81 @@ sequenceDiagram
   participant D as SQLite/GORM
   participant S as Scanner
   participant C as ChainAdapter
-  participant N as TronGrid/Node
+  participant N as RPC/Node
   participant H as CallbackEndpoint
 
-  B->>A: POST /addresses (register watch)
-  A->>D: Save WatchedAddress (init last_seen_height)
+  B->>A: POST /addresses
+  A->>D: Save WatchedAddress
   D-->>A: OK
   A-->>B: 201 Created
 
-  Note right of S: 定时任务触发 / POST /scan/once
+  Note right of S: 定时扫描 / POST /scan/once
   S->>D: Load enabled watched addresses
-  D-->>S: WatchedAddress list
+  D-->>S: Address list
 
-  loop each watched address
-    S->>C: ScanAddress(watched, last_seen_height)
-    alt tron native
-      C->>N: Query account transactions (confirmed TRX incoming)
-      N-->>C: tx list + current block height
-    else tron trc20
-      C->>N: Query account TRC20 transactions
-      C->>N: Query tx detail by txid (get block height)
-      N-->>C: tx list + current block height
-    else mock
-      C-->>S: Read mock transactions
-    end
-
+  loop each watched address or scan bucket
+    S->>C: ScanAddress / scan logs
+    C->>N: Query transactions or logs
+    N-->>C: Incremental txs/logs
     C-->>S: Normalized tx list
 
-    alt no new incoming tx
-      S-->>S: End current watched target
-    else duplicated tx (already delivered)
+    alt duplicated
       S->>D: Check ProcessedTx
-      D-->>S: Already exists
-      S-->>S: Skip enqueue
-    else new valid incoming tx
-      S->>D: Insert CallbackTask (unique, status=pending, next_retry_at=now)
-      D-->>S: Created or duplicate
-      S->>D: Update WatchedAddress.last_seen_height
+      D-->>S: Exists
+      S-->>S: Skip
+    else new event
+      S->>D: Insert CallbackTask
+      S->>D: Update last_seen_height
     end
   end
 
-  Note right of S: 本轮扫描结束后，处理到期回调任务
-  S->>D: Load due CallbackTask (status=pending/retrying, next_retry_at is due)
+  S->>D: Load due callback tasks
   D-->>S: Task list
 
   loop each callback task
-    S->>H: HTTP POST callback payload (+ signature headers)
-    alt callback returns 2xx
+    S->>H: HTTP POST callback
+    alt 2xx
       H-->>S: ACK
-      Note right of H: 业务侧匹配订单，更新支付状态与账务
-      S->>D: Update task status=success, insert ProcessedTx
-    else callback timeout / non-2xx
+      S->>D: Mark success + insert ProcessedTx
+    else timeout/non-2xx
       H-->>S: Error
-      S->>D: Update task status=retrying/dead (backoff + last_error)
+      S->>D: Mark retrying/dead
     end
   end
 ```
 
-## 3. SVG 预览
+## 4. 关键控制点
 
-![业务链调用流程图](./business_call_flow.svg)
+### 4.1 幂等控制
+系统通过两层控制避免重复通知：
+- `CallbackTask` 唯一键：防止重复入队
+- `ProcessedTx` 唯一键：防止重复成功投递
 
-## 4. 主流程说明
+对于 EVM，同一笔交易里可能有多条 `Transfer`，因此唯一标识是：
+- `tx_hash + log_index`
 
-### 4.1 注册监控地址
+### 4.2 确认数控制
+只有达到 `min_confirmations` 的交易才会被回调。
 
-业务系统在创建收款订单或生成收款地址后，调用监控服务：
+这意味着：
+- 系统不会把未确认交易直接通知业务方
+- 当前实现优先通过确认数降低 reorg 风险
 
-- `POST /addresses`
+### 4.3 回调安全控制
+如果配置了 `-callback-secret`，每次回调会带：
+- `X-WalletMonitor-Timestamp`
+- `X-WalletMonitor-Signature`
+- `X-WalletMonitor-Event-ID`
 
-请求中通常包含：
+业务方必须做两件事：
+1. 验签
+2. 按事件 ID 做幂等
 
-- `chain`
-- `network`
-- `address`
-- `asset_type`
-- `token_contract`（TRC20 时需要）
-- `callback_url`
+## 5. 当前适用范围
 
-监控服务收到后会把监控目标写入 `WatchedAddress` 表。
+当前这条链路已适用于：
+- 本地 mock 联调
+- TRON 主网/测试网已确认入账扫描
+- EVM ERC20 入账扫描
 
-### 4.2 定时扫描
-
-监控服务会周期性触发扫描，或者手动调用：
-
-- `POST /scan/once`
-
-扫描时会：
-
-1. 从数据库读取所有 `enabled = true` 的地址；
-2. 按 `chain / network / asset_type` 选择对应扫描适配器；
-3. 带着 `last_seen_height` 去链上查询增量入账。
-
-## 5. 链上查询逻辑
-
-当前已支持：
-
-- `tron + native`：已确认 `TRX` 入账
-- `tron + trc20`：已确认 `TRC20` 入账
-- `mock`：本地联调
-
-查询结果返回后，监控服务会：
-
-- 判断是否有新交易；
-- 检查 `ProcessedTx` 去重；
-- 更新 `last_seen_height`；
-- 对需要回调的交易生成统一回调 payload。
-
-## 6. 回调阶段
-
-当发现新的有效入账时，监控服务会向业务方的回调地址发起：
-
-- `HTTP POST callback_url`
-
-回调内容包含（见 `CallbackPayload`）：
-
-- `chain`
-- `network`
-- `asset_type`
-- `token_contract`
-- `token_symbol`
-- `token_decimals`
-- `address`
-- `tx_hash`
-- `from`
-- `to`
-- `amount`
-- `block_height`
-
-业务方返回 `2xx` 后，监控服务会记录该交易为已处理，避免重复通知。
-
-## 7. 分支说明
-
-### 7.1 无新交易
-
-如果链上没有发现新入账：
-
-- 本轮扫描结束；
-- 等待下一轮定时扫描。
-
-### 7.2 重复交易
-
-如果交易已经存在于 `ProcessedTx`：
-
-- 不重复回调；
-- 直接跳过。
-
-### 7.3 回调失败
-
-当前版本行为（生产可用的最小闭环）：
-
-- 扫描阶段只负责把回调写入 `CallbackTask` 作为“持久化队列”，不会因为一次回调失败就丢单；
-- 回调发送由任务执行器处理：失败会写入 `last_error`，并按指数退避更新 `next_retry_at`；
-- 超过最大重试次数会进入 `dead` 状态，可通过管理接口手动重试。
-
-## 8. 适合对外讲的总结
-
-这套链路可以概括成一句话：
-
-**业务系统只负责注册收款地址和接收回调，监控服务负责扫链、判定入账、去重和通知。**
+**该流程已经可以支撑单机部署场景下的实际入账监控，但高可用、多实例和更广泛多链能力仍属于后续演进项。**
